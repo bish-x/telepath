@@ -1,0 +1,29 @@
+# Secrets and local state
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime data: Telegram sessions, SQLite DB, anything app writes to disk
+data/
+*.session
+*.session-journal
+*.sqlite
+*.sqlite-journal
+*.sqlite3
+*.sqlite3-journal
+
+# Tooling caches and local notes
+.tmp/
+.omc/
+.DS_Store

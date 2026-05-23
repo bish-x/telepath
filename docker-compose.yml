@@ -1,0 +1,14 @@
+services:
+  telepath:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: telepath:local
+    container_name: telepath
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    stop_grace_period: 30s
+    # tini handles signals via ENTRYPOINT — keep compose's init disabled.
+    init: false

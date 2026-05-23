@@ -1,0 +1,50 @@
+[project]
+name = "telepath"
+version = "0.1.1"
+description = "Telepath — personal Telegram account assistant with owner-only bot controls and pluggable LLM text polishing (Copilot CLI / OpenAI / Anthropic)."
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram>=3.7,<4",
+    "anthropic>=0.39,<1",
+    "openai>=1.40,<2",
+    "python-dotenv>=1.0,<2",
+    "telethon>=1.36,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2,<9",
+    "pytest-asyncio>=0.23,<1",
+]
+
+[project.scripts]
+telepath = "telepath.app:main"
+telepath-auth = "telepath.auth:main"
+telepath-manager = "telepath.manager_bot:main"
+telepath-user = "telepath.user_client:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.coverage.run]
+source = ["telepath"]
+branch = false
+
+[tool.coverage.report]
+fail_under = 100
+show_missing = true
+exclude_also = [
+    # __main__ guards never fire under pytest.
+    "if __name__ == .__main__.:",
+    # typing-only helpers
+    "@(typing\\.)?overload",
+    "class .*\\(.*Protocol.*\\):",
+    # Bodies that genuinely require a live Telegram or LLM API (no mocks possible).
+    "# pragma: no cover - integration only",
+]
