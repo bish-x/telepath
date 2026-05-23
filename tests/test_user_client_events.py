@@ -248,9 +248,39 @@ async def test_private_chat_history_gate_counts_until_threshold_and_persists_all
     class FakeClient:
         async def iter_messages(self, chat_id, *, limit):
             assert chat_id == 100
-            assert limit == 100
+            # Gate now over-fetches so service messages can't undercount us.
+            assert limit == 300
             for message_id in range(100):
                 yield type("Message", (), {"id": message_id, "action": None})()
+
+    repo = FakePrivateGateRepository()
+    gate = PrivateChatHistoryGate(FakeClient(), repo)
+
+    assert await gate.has_enough_messages(100, 100)
+    assert repo.saved == [(100, 100, True)]
+
+
+async def test_private_chat_history_gate_skips_action_messages_with_headroom():
+    """Regression: with `limit == minimum`, a chat where the last N messages
+    contain even one service event would be rejected even if hundreds of
+    plain messages exist beyond. The gate must over-fetch and still reach
+    the threshold."""
+
+    class FakeClient:
+        async def iter_messages(self, chat_id, *, limit):
+            assert limit == 300  # 100 minimum * 3 multiplier
+            # 3 service messages mixed with 100 plain — the old impl would
+            # have stopped at 97 plain and denied. With over-fetch we should
+            # cross the threshold.
+            yielded_plain = 0
+            yielded_total = 0
+            while yielded_total < 200 and yielded_plain < 100:
+                yielded_total += 1
+                if yielded_total in (5, 50, 95):
+                    yield type("Message", (), {"id": yielded_total, "action": object()})()
+                else:
+                    yielded_plain += 1
+                    yield type("Message", (), {"id": yielded_total, "action": None})()
 
     repo = FakePrivateGateRepository()
     gate = PrivateChatHistoryGate(FakeClient(), repo)

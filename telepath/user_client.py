@@ -147,9 +147,19 @@ class PrivateChatHistoryGate:
                 await self.sleep(delay)
         self._last_history_fetch_at = self.monotonic()
 
+    # Multiplier for how many raw messages to pull when counting *visible*
+    # (non-service) ones. Telegram returns service messages — joined, pinned,
+    # photo changed, etc. — inside the same iter_messages stream, and Telethon
+    # counts them against the `limit`. If a chat has, say, 97 plain + 3 service
+    # messages and we ask for limit=100, we'd cap at 97 plain and falsely
+    # reject the chat. The multiplier gives enough headroom to find 100 plain
+    # messages even when service messages are interleaved.
+    _visible_fetch_multiplier = 3
+
     async def _count_visible_messages(self, chat_id: int, minimum_messages: int) -> int:
         count = 0
-        async for message in self.client.iter_messages(chat_id, limit=minimum_messages):
+        fetch_limit = max(minimum_messages, minimum_messages * self._visible_fetch_multiplier)
+        async for message in self.client.iter_messages(chat_id, limit=fetch_limit):
             if getattr(message, "action", None) is not None:
                 continue
             count += 1
