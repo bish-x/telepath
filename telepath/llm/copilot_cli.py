@@ -25,13 +25,16 @@ class CommandRunner(Protocol):
 
 class SubprocessRunner:
     def run(self, args: list[str], *, timeout: int) -> str:
-        completed = subprocess.run(
-            args,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        try:
+            completed = subprocess.run(
+                args,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise CopilotError(f"Copilot CLI timed out after {timeout} seconds") from exc
         if completed.returncode != 0:
             stderr = completed.stderr.strip() or "unknown Copilot CLI error"
             raise CopilotError(stderr)
@@ -43,7 +46,7 @@ class CopilotCliTextPolisher:
     runner: CommandRunner | None = None
     command: str = "copilot"
     model: str | None = None
-    timeout_seconds: int = 60
+    timeout_seconds: int = 300
 
     def __post_init__(self) -> None:
         if self.runner is None:

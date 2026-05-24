@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Protocol
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -212,7 +216,19 @@ class VoiceTranscriptionFeature:
             return PreparedTranscription("transcription_unavailable", mark_processed=True)
         if not raw_text.strip():
             return PreparedTranscription("empty_transcription", mark_processed=True)
-        polished_text = remove_terminal_paragraph_periods(context.polisher.polish(raw_text, prompt=prompt))
+        try:
+            polished_text = remove_terminal_paragraph_periods(context.polisher.polish(raw_text, prompt=prompt))
+        except Exception as exc:
+            logger.warning(
+                "voice_polish_failed chat_id=%s message_id=%s error=%s falling back to raw transcription",
+                event.chat_id,
+                event.message_id,
+                exc,
+            )
+            fallback_text = remove_terminal_paragraph_periods(raw_text.strip())
+            if not fallback_text:
+                return PreparedTranscription("empty_transcription", mark_processed=True)
+            return PreparedTranscription("voice_transcribed_unpolished", text=fallback_text)
         if not polished_text:
             return PreparedTranscription("empty_transcription", mark_processed=True)
         return PreparedTranscription("voice_transcribed", text=polished_text)

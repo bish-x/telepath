@@ -35,7 +35,7 @@ class Settings:
     llm_provider: str = "copilot"
     copilot_command: str = "copilot"
     copilot_model: str | None = DEFAULT_COPILOT_MODEL
-    copilot_timeout_seconds: int = 60
+    copilot_timeout_seconds: int = 300
     openai_api_key: str | None = None
     openai_model: str = DEFAULT_OPENAI_MODEL
     openai_base_url: str | None = None
@@ -101,7 +101,7 @@ def load_settings() -> Settings:
         llm_provider=provider,
         copilot_command=os.getenv("COPILOT_COMMAND", "copilot"),
         copilot_model=os.getenv("COPILOT_MODEL") or DEFAULT_COPILOT_MODEL,
-        copilot_timeout_seconds=int(os.getenv("COPILOT_TIMEOUT_SECONDS", "60")),
+        copilot_timeout_seconds=int(os.getenv("COPILOT_TIMEOUT_SECONDS", "300")),
         openai_api_key=openai_api_key,
         openai_model=os.getenv("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL,
         openai_base_url=_optional_env("OPENAI_BASE_URL"),

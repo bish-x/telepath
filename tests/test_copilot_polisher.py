@@ -126,6 +126,19 @@ def test_subprocess_runner_raises_copilot_error_on_nonzero_exit(monkeypatch):
         SubprocessRunner().run(["copilot"], timeout=10)
 
 
+def test_subprocess_runner_wraps_timeout_as_copilot_error(monkeypatch):
+    import subprocess
+    from telepath.llm.copilot_cli import CopilotError, SubprocessRunner
+
+    def fake_run(args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args, timeout=kwargs.get("timeout", 0))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(CopilotError, match="timed out after 7 seconds"):
+        SubprocessRunner().run(["copilot"], timeout=7)
+
+
 def test_subprocess_runner_provides_generic_error_when_stderr_empty(monkeypatch):
     import subprocess
     from telepath.llm.copilot_cli import CopilotError, SubprocessRunner

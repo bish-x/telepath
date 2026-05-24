@@ -45,12 +45,15 @@ class FakeTranscriber:
 
 
 class FakePolisher:
-    def __init__(self, polished_text="Привет, мир."):
+    def __init__(self, polished_text="Привет, мир.", error=None):
         self.calls = []
         self.polished_text = polished_text
+        self.error = error
 
     def polish(self, text, prompt=None):
         self.calls.append((text, prompt))
+        if self.error is not None:
+            raise self.error
         return self.polished_text
 
 
@@ -128,6 +131,7 @@ def make_context(
     transcriber_error=None,
     transcriber_delay_seconds=0,
     polished_text="Привет, мир.",
+    polisher_error=None,
     decoration_enabled=False,
     private_chat_allowed=True,
 ):
@@ -135,7 +139,7 @@ def make_context(
         FakeBlacklist(blocked or set()),
         FakeGroupWhitelist(groups or set()),
         FakeTranscriber(error=transcriber_error, delay_seconds=transcriber_delay_seconds),
-        FakePolisher(polished_text=polished_text),
+        FakePolisher(polished_text=polished_text, error=polisher_error),
         FakeReplies(error=reply_error),
         FakeSettings(enabled=enabled, decoration_enabled=decoration_enabled),
         FakeProcessed(already_processed=already_processed),
@@ -461,5 +465,32 @@ async def test_voice_feature_marks_processed_when_polished_text_is_empty():
     result = await feature.handle(voice_event(), context)
 
     assert result == "empty_transcription"
+    assert context.replies.sent == []
+    assert context.processed.mark_processed_calls == [(100, 50, "voice_transcription")]
+
+
+async def test_voice_feature_falls_back_to_raw_text_when_polisher_fails():
+    context = make_context(polisher_error=RuntimeError("copilot timed out"))
+    feature = VoiceTranscriptionFeature()
+
+    result = await feature.handle(voice_event(), context)
+
+    assert result == "voice_transcribed_unpolished"
+    assert context.transcriber.calls == [(100, 50)]
+    assert context.polisher.calls == [("привет мир", "runtime prompt")]
+    assert context.replies.sent == [(100, 50, "привет мир", False)]
+    assert context.processed.mark_processed_calls == [(100, 50, "voice_transcription")]
+
+
+async def test_voice_feature_marks_processed_when_polisher_fails_and_raw_is_blank():
+    context = make_context(polisher_error=RuntimeError("copilot crashed"))
+    context.transcriber.transcript = "   "
+    feature = VoiceTranscriptionFeature()
+
+    result = await feature.handle(voice_event(), context)
+
+    # transcriber returns whitespace-only — short-circuited before polish even runs
+    assert result == "empty_transcription"
+    assert context.polisher.calls == []
     assert context.replies.sent == []
     assert context.processed.mark_processed_calls == [(100, 50, "voice_transcription")]

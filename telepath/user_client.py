@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 class TelethonTranscriber:
-    def __init__(self, client: Any, *, update_timeout_seconds: float = 30.0):
+    def __init__(self, client: Any, *, update_timeout_seconds: float = 60.0):
         self.client = client
         self.update_timeout_seconds = update_timeout_seconds
 
@@ -84,6 +84,15 @@ class TelethonTranscriber:
             try:
                 return await asyncio.wait_for(final_text, timeout=self.update_timeout_seconds)
             except asyncio.TimeoutError:
+                logger.warning(
+                    "voice_transcribe_update_timeout chat_id=%s message_id=%s "
+                    "timeout_seconds=%s latest_text_chars=%d transcription_id=%s",
+                    chat_id,
+                    message_id,
+                    self.update_timeout_seconds,
+                    len(latest_text),
+                    target_transcription_id,
+                )
                 return latest_text
         finally:
             self.client.remove_event_handler(handle_raw_update, events.Raw)
