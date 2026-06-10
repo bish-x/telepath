@@ -43,6 +43,10 @@ class VoiceTranscriptionUnavailableError(Exception):
     pass
 
 
+class VoiceTranscriptionPendingTimeoutError(Exception):
+    pass
+
+
 class TextPolisherPort(Protocol):
     def polish(self, text: str, prompt: str | None = None) -> str: ...
 
@@ -55,6 +59,10 @@ class SettingsPort(Protocol):
     def is_feature_enabled(self, feature: str) -> bool: ...
     def get_text_polish_prompt(self) -> str: ...
     def is_transcription_decoration_enabled(self) -> bool: ...
+    def get_private_chat_min_messages(self) -> int: ...
+    def get_voice_min_duration_seconds(self) -> int: ...
+    def is_private_chat_transcription_enabled(self, chat_id: int) -> bool: ...
+    def get_private_chat_transcription_override(self, chat_id: int) -> bool | None: ...
 
 
 class ProcessedMessagesPort(Protocol):
@@ -154,7 +162,6 @@ def remove_terminal_paragraph_periods(text: str) -> str:
 class VoiceTranscriptionFeature:
     name = "voice_transcription"
     max_duration_seconds = 300
-    min_private_chat_messages = 100
 
     def __init__(self, coordinator: TranscriptionCoordinator | None = None) -> None:
         self.coordinator = coordinator or TranscriptionCoordinator()
@@ -170,8 +177,15 @@ class VoiceTranscriptionFeature:
                 return "private_bot_chat_skipped"
             if context.blacklist.is_blocked(event.chat_id):
                 return "chat_blocked"
-            if not await context.private_chat_gate.has_enough_messages(event.chat_id, self.min_private_chat_messages):
-                return "private_chat_too_new"
+            private_override = context.settings.get_private_chat_transcription_override(event.chat_id)
+            if private_override is False:
+                return "private_chat_disabled"
+            if private_override is not True:
+                if not await context.private_chat_gate.has_enough_messages(
+                    event.chat_id,
+                    context.settings.get_private_chat_min_messages(),
+                ):
+                    return "private_chat_too_new"
         elif event.is_group:
             if not context.group_whitelist.is_group_allowed(event.chat_id):
                 return "group_not_allowed"
@@ -182,6 +196,10 @@ class VoiceTranscriptionFeature:
         if event.duration_seconds is not None and event.duration_seconds > self.max_duration_seconds:
             context.processed.mark_processed(event.chat_id, event.message_id, self.name)
             return "voice_too_long"
+        min_duration = context.settings.get_voice_min_duration_seconds()
+        if event.duration_seconds is not None and event.duration_seconds < min_duration:
+            context.processed.mark_processed(event.chat_id, event.message_id, self.name)
+            return "voice_too_short"
 
         prompt = context.settings.get_text_polish_prompt()
         prepared = await self.coordinator.prepare(
@@ -214,6 +232,8 @@ class VoiceTranscriptionFeature:
             return PreparedTranscription("voice_too_long", mark_processed=True)
         except VoiceTranscriptionUnavailableError:
             return PreparedTranscription("transcription_unavailable", mark_processed=True)
+        except VoiceTranscriptionPendingTimeoutError:
+            return PreparedTranscription("transcription_pending_timeout")
         if not raw_text.strip():
             return PreparedTranscription("empty_transcription", mark_processed=True)
         try:

@@ -5,7 +5,11 @@ import pytest
 from telethon.errors import rpcbaseerrors
 from telethon import types
 
-from telepath.features.voice_transcription import VoiceTranscriptionUnavailableError, VoiceTooLongError
+from telepath.features.voice_transcription import (
+    VoiceTranscriptionPendingTimeoutError,
+    VoiceTranscriptionUnavailableError,
+    VoiceTooLongError,
+)
 from telepath.user_client import TelethonTranscriber
 
 
@@ -46,6 +50,18 @@ class FakeClient:
         return self.result
 
 
+class FakeClientSequence(FakeClient):
+    def __init__(self, results):
+        super().__init__(results[0])
+        self.results = list(results)
+        self.call_count = 0
+
+    async def __call__(self, request):
+        result = self.results[min(self.call_count, len(self.results) - 1)]
+        self.call_count += 1
+        return result
+
+
 async def test_transcriber_returns_immediate_text_without_waiting_for_update():
     client = FakeClient(TranscribeResult(text="готово"))
     transcriber = TelethonTranscriber(client, update_timeout_seconds=0.01)
@@ -74,6 +90,46 @@ async def test_transcriber_returns_initial_text_when_pending_update_times_out():
     transcriber = TelethonTranscriber(client, update_timeout_seconds=0.01)
 
     assert await transcriber.transcribe(chat_id=100, message_id=50) == "частичный"
+    assert client.removed
+
+
+async def test_transcriber_retries_pending_empty_timeout_before_returning_text():
+    client = FakeClientSequence(
+        [
+            TranscribeResult(text="", pending=True, transcription_id=777),
+            TranscribeResult(text="готово позже", pending=False, transcription_id=777),
+        ]
+    )
+    transcriber = TelethonTranscriber(
+        client,
+        update_timeout_seconds=0.01,
+        empty_timeout_retries=1,
+        empty_timeout_retry_delay_seconds=0,
+    )
+
+    assert await transcriber.transcribe(chat_id=100, message_id=50) == "готово позже"
+    assert client.call_count == 2
+    assert client.removed
+
+
+async def test_transcriber_raises_when_pending_empty_timeout_retries_are_exhausted():
+    client = FakeClientSequence(
+        [
+            TranscribeResult(text="", pending=True, transcription_id=777),
+            TranscribeResult(text="", pending=True, transcription_id=777),
+        ]
+    )
+    transcriber = TelethonTranscriber(
+        client,
+        update_timeout_seconds=0.01,
+        empty_timeout_retries=1,
+        empty_timeout_retry_delay_seconds=0,
+    )
+
+    with pytest.raises(VoiceTranscriptionPendingTimeoutError):
+        await transcriber.transcribe(chat_id=100, message_id=50)
+
+    assert client.call_count == 2
     assert client.removed
 
 

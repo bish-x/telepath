@@ -3,7 +3,7 @@ import logging
 
 import pytest
 
-from telepath.user_client import DEFAULT_VOICE_QUEUE_MAXSIZE, VoiceQueueWorker
+from telepath.user_client import DEFAULT_VOICE_QUEUE_MAXSIZE, ChannelReactionQueueWorker, VoiceQueueWorker
 
 
 class _Event:
@@ -167,6 +167,157 @@ async def test_worker_submit_is_synchronous_and_non_blocking():
     assert worker.submit(_Event(1, 4)) is False
     assert worker.qsize() == 3
     assert worker.dropped_count == 1
+
+
+async def test_channel_reaction_worker_reads_delay_range_for_each_event():
+    events = []
+    sleeps = []
+    ranges = [(1, 1), (5, 5)]
+
+    async def handler(event):
+        events.append(event.message.id)
+
+    async def sleep(delay):
+        sleeps.append(delay)
+
+    worker = ChannelReactionQueueWorker(
+        handler=handler,
+        delay_range_provider=lambda: ranges.pop(0),
+        sleep=sleep,
+    )
+    consumer = asyncio.create_task(worker.run())
+
+    assert worker.submit(_Event(100, 1))
+    assert worker.submit(_Event(100, 2))
+    await _drain(worker, expected=2)
+
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+
+    assert events == [1, 2]
+    assert sleeps == [1, 5]
+
+
+async def test_channel_reaction_worker_applies_delays_concurrently():
+    events = []
+    sleeps = []
+    both_delays_started = asyncio.Event()
+    release_delays = asyncio.Event()
+    ranges = [(10, 10), (20, 20)]
+
+    async def handler(event):
+        events.append(event.message.id)
+
+    async def sleep(delay):
+        sleeps.append(delay)
+        if len(sleeps) == 2:
+            both_delays_started.set()
+        await release_delays.wait()
+
+    worker = ChannelReactionQueueWorker(
+        handler=handler,
+        delay_range_provider=lambda: ranges.pop(0),
+        sleep=sleep,
+    )
+    consumer = asyncio.create_task(worker.run())
+
+    assert worker.submit(_Event(100, 1))
+    assert worker.submit(_Event(100, 2))
+    await asyncio.wait_for(both_delays_started.wait(), timeout=1.0)
+    assert events == []
+
+    release_delays.set()
+    await _drain(worker, expected=2)
+
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+
+    assert events == [1, 2]
+    assert sleeps == [10, 20]
+
+
+async def test_channel_reaction_worker_can_apply_post_dispatch_cooldown():
+    events = []
+    sleeps = []
+
+    async def handler(event):
+        events.append(event.message.id)
+
+    async def sleep(delay):
+        sleeps.append(delay)
+
+    worker = ChannelReactionQueueWorker(
+        handler=handler,
+        delay_range_provider=lambda: (1, 1),
+        post_dispatch_delay_range_seconds=(8, 8),
+        sleep=sleep,
+    )
+    consumer = asyncio.create_task(worker.run())
+
+    assert worker.submit(_Event(100, 1))
+    await _drain(worker, expected=1)
+
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+
+    assert events == [1]
+    assert sleeps == [1, 8]
+
+
+async def test_channel_reaction_worker_limits_pending_delayed_events(caplog):
+    delay_started = asyncio.Event()
+    release_delay = asyncio.Event()
+
+    async def handler(event):
+        return None
+
+    async def sleep(delay):
+        delay_started.set()
+        await release_delay.wait()
+
+    worker = ChannelReactionQueueWorker(handler=handler, maxsize=1, sleep=sleep)
+    consumer = asyncio.create_task(worker.run())
+
+    assert worker.submit(_Event(100, 1))
+    await delay_started.wait()
+    with caplog.at_level(logging.WARNING):
+        assert worker.submit(_Event(100, 2)) is False
+
+    release_delay.set()
+    await _drain(worker, expected=1)
+
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+
+    assert worker.dropped_count == 1
+    assert "channel_reaction_dropped_queue_full" in caplog.text
+
+
+async def test_channel_reaction_worker_skips_duplicate_posts(caplog):
+    events = []
+
+    async def handler(event):
+        events.append((event.chat_id, event.message.id))
+
+    worker = ChannelReactionQueueWorker(handler=handler, sleep=lambda delay: asyncio.sleep(0))
+    consumer = asyncio.create_task(worker.run())
+
+    assert worker.submit(_Event(100, 1)) is True
+    with caplog.at_level(logging.INFO):
+        assert worker.submit(_Event(100, 1)) is False
+    await _drain(worker, expected=1)
+
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+
+    assert events == [(100, 1)]
+    assert worker.processed_count == 1
+    assert "channel_reaction_duplicate_skipped" in caplog.text
 
 
 # ---------------------------------------------------------------------------

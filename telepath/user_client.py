@@ -2,12 +2,32 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
+from collections import Counter, OrderedDict, deque
+from dataclasses import dataclass, field, replace
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
 from telepath.config import Settings, load_settings
 from telepath.features.base import FeatureRegistry
+from telepath.features.channel_reactions import (
+    DEFAULT_REACTION_EMOJIS,
+    ChannelMessageEvent,
+    ChannelReactionFeature,
+    ReactionCandidate,
+    ReactionSendResult,
+    effective_max_reactions,
+    fallback_reaction_candidates,
+    order_reaction_candidates,
+    reaction_candidate_key,
+    reaction_category,
+    select_from_ordered_reaction_candidates,
+    sent_reaction_count as resolve_sent_reaction_count,
+    sent_reaction_keys as resolve_sent_reaction_keys,
+)
 from telepath.features.voice_transcription import (
+    VoiceTranscriptionPendingTimeoutError,
     VoiceMessageEvent,
     VoiceTranscriptionUnavailableError,
     VoiceTooLongError,
@@ -24,9 +44,22 @@ logger = logging.getLogger(__name__)
 
 
 class TelethonTranscriber:
-    def __init__(self, client: Any, *, update_timeout_seconds: float = 60.0):
+    def __init__(
+        self,
+        client: Any,
+        *,
+        update_timeout_seconds: float = 60.0,
+        empty_timeout_retries: int = 2,
+        empty_timeout_retry_delay_seconds: float = 0.0,
+        sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+    ):
+        if empty_timeout_retries < 0:
+            raise ValueError("empty_timeout_retries must be non-negative")
         self.client = client
         self.update_timeout_seconds = update_timeout_seconds
+        self.empty_timeout_retries = empty_timeout_retries
+        self.empty_timeout_retry_delay_seconds = empty_timeout_retry_delay_seconds
+        self.sleep = sleep
 
     async def transcribe(self, chat_id: int, message_id: int) -> str:
         from telethon import errors, events, functions, types
@@ -63,37 +96,50 @@ class TelethonTranscriber:
         self.client.add_event_handler(handle_raw_update, events.Raw)
         peer = await self.client.get_input_entity(chat_id)
         try:
-            try:
-                result = await self.client(functions.messages.TranscribeAudioRequest(peer=peer, msg_id=message_id))
-            except errors.BadRequestError as error:
-                message = getattr(error, "message", "")
-                if message == "MSG_VOICE_TOO_LONG":
-                    raise VoiceTooLongError from error
-                if message == "TRANSCRIPTION_FAILED":
-                    raise VoiceTranscriptionUnavailableError from error
-                raise
-            latest_text = getattr(result, "text", "") or ""
-            target_transcription_id = getattr(result, "transcription_id", None)
-            if not getattr(result, "pending", False):
-                return latest_text
+            for attempt in range(self.empty_timeout_retries + 1):
+                final_text = loop.create_future()
+                try:
+                    result = await self.client(functions.messages.TranscribeAudioRequest(peer=peer, msg_id=message_id))
+                except errors.BadRequestError as error:
+                    message = getattr(error, "message", "")
+                    if message == "MSG_VOICE_TOO_LONG":
+                        raise VoiceTooLongError from error
+                    if message == "TRANSCRIPTION_FAILED":
+                        raise VoiceTranscriptionUnavailableError from error
+                    raise
+                latest_text = getattr(result, "text", "") or ""
+                target_transcription_id = getattr(result, "transcription_id", None)
+                if not getattr(result, "pending", False):
+                    return latest_text
 
-            for update in buffered_updates:
-                apply_update(update)
-            if final_text.done():
-                return final_text.result()
-            try:
-                return await asyncio.wait_for(final_text, timeout=self.update_timeout_seconds)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "voice_transcribe_update_timeout chat_id=%s message_id=%s "
-                    "timeout_seconds=%s latest_text_chars=%d transcription_id=%s",
-                    chat_id,
-                    message_id,
-                    self.update_timeout_seconds,
-                    len(latest_text),
-                    target_transcription_id,
-                )
-                return latest_text
+                for update in buffered_updates:
+                    apply_update(update)
+                buffered_updates.clear()
+                if final_text.done():
+                    return final_text.result()
+                try:
+                    return await asyncio.wait_for(final_text, timeout=self.update_timeout_seconds)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "voice_transcribe_update_timeout chat_id=%s message_id=%s "
+                        "timeout_seconds=%s latest_text_chars=%d transcription_id=%s "
+                        "empty_timeout_retry=%s/%s",
+                        chat_id,
+                        message_id,
+                        self.update_timeout_seconds,
+                        len(latest_text),
+                        target_transcription_id,
+                        attempt,
+                        self.empty_timeout_retries,
+                    )
+                    if latest_text:
+                        return latest_text
+                    if attempt >= self.empty_timeout_retries:
+                        raise VoiceTranscriptionPendingTimeoutError from None
+                    target_transcription_id = None
+                    if self.empty_timeout_retry_delay_seconds > 0:
+                        await self.sleep(self.empty_timeout_retry_delay_seconds)
+            raise VoiceTranscriptionPendingTimeoutError
         finally:
             self.client.remove_event_handler(handle_raw_update, events.Raw)
 
@@ -349,6 +395,894 @@ def voice_message_fingerprint(message: Any) -> str | None:
     return f"telegram-document:{kind}:{int(document_id)}"
 
 
+def build_channel_message_event(event: Any) -> ChannelMessageEvent:
+    message = event.message
+    grouped_id = getattr(message, "grouped_id", None)
+    return ChannelMessageEvent(
+        chat_id=int(event.chat_id),
+        message_id=int(message.id),
+        is_channel=bool(getattr(event, "is_channel", False)),
+        is_group=bool(getattr(event, "is_group", False)),
+        grouped_id=int(grouped_id) if grouped_id is not None else None,
+        message=message,
+    )
+
+
+def is_reactable_channel_message(event: Any) -> bool:
+    message = getattr(event, "message", None)
+    if getattr(message, "action", None) is not None:
+        return False
+    return bool(getattr(event, "is_channel", False) and not getattr(event, "is_group", False))
+
+
+def should_enqueue_channel_reaction(event: Any, repository: Any) -> bool:
+    if not is_reactable_channel_message(event):
+        return False
+    if not repository.is_reaction_autolike_enabled():
+        return False
+    settings = repository.get_effective_reaction_channel_settings(int(event.chat_id))
+    return bool(settings and settings.enabled)
+
+
+def classify_dialog_kind(dialog: Any) -> str:
+    if getattr(dialog, "is_user", False):
+        return "private"
+    if getattr(dialog, "is_group", False):
+        return "group"
+    if getattr(dialog, "is_channel", False):
+        return "channel"
+    return "chat"
+
+
+async def remember_chat_from_event(event: Any, repository: Any) -> None:
+    kind = "chat"
+    if getattr(event, "is_private", False):
+        kind = "private"
+    elif getattr(event, "is_group", False):
+        kind = "group"
+    elif getattr(event, "is_channel", False):
+        kind = "channel"
+
+    title = None
+    chat = getattr(event, "chat", None)
+    if chat is None:
+        try:
+            chat = await event.get_chat()
+        except Exception:
+            chat = None
+    if chat is not None:
+        title = (
+            getattr(chat, "title", None)
+            or getattr(chat, "first_name", None)
+            or getattr(chat, "username", None)
+        )
+    repository.upsert_known_chat(int(event.chat_id), title, kind, last_seen_at=int(time.time()))
+
+
+async def sync_chat_catalog(client: Any, repository: Any) -> None:
+    base_seen_at = int(time.time())
+    index = 0
+    async for dialog in client.iter_dialogs():
+        repository.upsert_known_chat(
+            int(dialog.id),
+            getattr(dialog, "title", None),
+            classify_dialog_kind(dialog),
+            last_seen_at=base_seen_at - index,
+        )
+        index += 1
+
+
+def _dialog_filter_title(folder: Any) -> str:
+    title = getattr(folder, "title", None)
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    text = getattr(title, "text", None)
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    folder_id = getattr(folder, "id", None)
+    return f"Папка {folder_id}" if folder_id is not None else "Папка"
+
+
+def _dialog_filter_type(folder: Any) -> str:
+    return folder.__class__.__name__
+
+
+def _dialog_filter_explicit_peers(folder: Any) -> list[Any]:
+    from telethon import utils
+
+    peers = list(getattr(folder, "pinned_peers", None) or [])
+    peers.extend(getattr(folder, "include_peers", None) or [])
+    unique: list[Any] = []
+    seen: set[object] = set()
+    for peer in peers:
+        try:
+            key: object = utils.get_peer_id(peer)
+        except TypeError:
+            key = (peer.__class__.__name__, repr(peer))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(peer)
+    return unique
+
+
+def _classify_peer_entity_kind(entity: Any) -> str:
+    if getattr(entity, "broadcast", False):
+        return "channel"
+    if getattr(entity, "megagroup", False):
+        return "group"
+    class_name = entity.__class__.__name__
+    if class_name in {"Chat", "ChatForbidden"}:
+        return "group"
+    if class_name in {"User", "UserEmpty"}:
+        return "private"
+    return "chat"
+
+
+def _entity_title(entity: Any) -> str | None:
+    title = (
+        getattr(entity, "title", None)
+        or getattr(entity, "first_name", None)
+        or getattr(entity, "username", None)
+    )
+    return str(title) if title else None
+
+
+def _reaction_folder_peer_resolve_errors() -> tuple[type[Exception], ...]:
+    from telethon import errors
+
+    return (
+        ValueError,
+        errors.ChannelInvalidError,
+        errors.ChannelPrivateError,
+        errors.ChatAdminRequiredError,
+    )
+
+
+async def _entities_for_reaction_folder_peers(client: Any, peers: list[Any], *, folder_id: int) -> list[Any]:
+    if not peers:
+        return []
+    resolve_errors = _reaction_folder_peer_resolve_errors()
+    try:
+        entities = await client.get_entity(peers)
+    except resolve_errors:
+        logger.warning(
+            "reaction_folder_peer_batch_resolve_failed folder_id=%s peer_count=%s",
+            folder_id,
+            len(peers),
+        )
+        resolved = []
+        for peer in peers:
+            try:
+                resolved.append(await client.get_entity(peer))
+            except resolve_errors:
+                logger.warning(
+                    "reaction_folder_peer_skipped folder_id=%s peer_type=%s",
+                    folder_id,
+                    peer.__class__.__name__,
+                )
+        return resolved
+    if isinstance(entities, (list, tuple)):
+        return list(entities)
+    return [entities]
+
+
+async def _reaction_folder_members_from_peers(client: Any, peers: list[Any], *, folder_id: int) -> list[dict[str, Any]]:
+    from telethon import utils
+
+    members_by_chat_id: dict[int, dict[str, Any]] = {}
+    for entity in await _entities_for_reaction_folder_peers(client, peers, folder_id=folder_id):
+        kind = _classify_peer_entity_kind(entity)
+        if kind != "channel":
+            continue
+        try:
+            chat_id = int(utils.get_peer_id(entity))
+        except TypeError:
+            logger.warning(
+                "reaction_folder_peer_id_failed folder_id=%s entity_type=%s",
+                folder_id,
+                entity.__class__.__name__,
+                exc_info=True,
+            )
+            continue
+        members_by_chat_id[chat_id] = {
+            "chat_id": chat_id,
+            "title": _entity_title(entity),
+            "kind": kind,
+        }
+    return list(members_by_chat_id.values())
+
+
+async def sync_reaction_folders(client: Any, repository: Any) -> int:
+    from telethon import errors
+    from telethon.tl.functions.messages import GetDialogFiltersRequest
+
+    result = await client(GetDialogFiltersRequest())
+    filters = getattr(result, "filters", result) or []
+    folders: list[dict[str, Any]] = []
+    for position, folder in enumerate(filters):
+        folder_id = getattr(folder, "id", None)
+        if folder_id is None:
+            continue
+        folder_id = int(folder_id)
+        members: list[dict[str, Any]] = []
+        explicit_peers = _dialog_filter_explicit_peers(folder)
+        if explicit_peers:
+            members = await _reaction_folder_members_from_peers(
+                client,
+                explicit_peers,
+                folder_id=folder_id,
+            )
+        else:
+            try:
+                async for dialog in client.iter_dialogs(folder=folder_id):
+                    kind = classify_dialog_kind(dialog)
+                    if kind != "channel":
+                        continue
+                    members.append(
+                        {
+                            "chat_id": int(dialog.id),
+                            "title": getattr(dialog, "title", None),
+                            "kind": kind,
+                        }
+                    )
+            except errors.FolderIdInvalidError:
+                logger.warning(
+                    "reaction_folder_invalid_folder_id folder_id=%s folder_type=%s",
+                    folder_id,
+                    _dialog_filter_type(folder),
+                )
+                members = await _reaction_folder_members_from_peers(
+                    client,
+                    explicit_peers,
+                    folder_id=folder_id,
+                )
+        folders.append(
+            {
+                "folder_id": folder_id,
+                "title": _dialog_filter_title(folder),
+                "position": position,
+                "members": members,
+            }
+        )
+    repository.replace_reaction_folder_catalog(folders)
+    return len(folders)
+
+
+async def refresh_reaction_folders_loop(
+    client: Any,
+    repository: Any,
+    *,
+    interval_seconds: float = 1800.0,
+    sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+) -> None:
+    while True:
+        await sleep(interval_seconds)
+        try:
+            count = await sync_reaction_folders(client, repository)
+        except Exception:
+            logger.exception("reaction_folder_sync_failed")
+            continue
+        logger.info("reaction_folder_sync_complete folders=%s", count)
+
+
+async def record_account_premium_status(client: Any, repository: Any) -> bool:
+    try:
+        me = await client.get_me()
+    except Exception:
+        logger.warning("account_premium_check_failed", exc_info=True)
+        return False
+    repository.set_account_premium(bool(getattr(me, "premium", False) or getattr(me, "is_premium", False)))
+    return True
+
+
+async def refresh_account_premium_status_loop(
+    client: Any,
+    repository: Any,
+    *,
+    interval_seconds: float = 3600.0,
+    sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+) -> None:
+    while True:
+        await sleep(interval_seconds)
+        await record_account_premium_status(client, repository)
+
+
+async def dispatch_channel_message(event: Any, registry: FeatureRegistry, context: AssistantContext) -> str | None:
+    if not is_reactable_channel_message(event):
+        return None
+
+    channel_event = build_channel_message_event(event)
+    logger.info(
+        "channel_post_received chat_id=%s message_id=%s grouped_id=%s",
+        channel_event.chat_id,
+        channel_event.message_id,
+        channel_event.grouped_id,
+    )
+    try:
+        result = await registry.dispatch(channel_event, context)
+    except Exception:
+        logger.exception(
+            "channel_reaction_dispatch_failed chat_id=%s message_id=%s",
+            channel_event.chat_id,
+            channel_event.message_id,
+        )
+        return "error"
+    logger.info(
+        "channel_reaction_dispatch_result chat_id=%s message_id=%s result=%s",
+        channel_event.chat_id,
+        channel_event.message_id,
+        result,
+    )
+    return str(result)
+
+
+class TelethonChannelReactionSender:
+    def __init__(
+        self,
+        client: Any,
+        *,
+        sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+        send_delay_seconds: float = 7.0,
+        refresh_message_before_send: bool = True,
+    ):
+        self.client = client
+        self.sleep = sleep
+        self.send_delay_seconds = send_delay_seconds
+        self.refresh_message_before_send = refresh_message_before_send
+
+    async def available_reactions(self, chat_id: int) -> list[ReactionCandidate]:
+        from telethon.tl.functions.channels import GetFullChannelRequest
+        from telethon.tl.types import ChatReactionsAll, ReactionCustomEmoji, ReactionEmoji, ReactionPaid
+
+        peer = await self.client.get_input_entity(chat_id)
+        full_channel = await self.client(GetFullChannelRequest(peer))
+        available = getattr(getattr(full_channel, "full_chat", None), "available_reactions", None)
+        if not available:
+            return []
+
+        if isinstance(available, ChatReactionsAll):
+            return [
+                ReactionCandidate(kind="emoji", emoji=emoji, value=ReactionEmoji(emoticon=emoji), category=reaction_category(emoji))
+                for emoji in DEFAULT_REACTION_EMOJIS
+            ]
+
+        reactions = getattr(available, "reactions", None)
+        if not reactions:
+            return []
+
+        default_emojis = set(DEFAULT_REACTION_EMOJIS)
+        candidates: list[ReactionCandidate] = []
+        for reaction in reactions:
+            if isinstance(reaction, ReactionPaid):
+                continue
+            if isinstance(reaction, ReactionCustomEmoji):
+                document_id = str(getattr(reaction, "document_id", ""))
+                candidates.append(
+                    ReactionCandidate(
+                        kind="custom",
+                        emoji=document_id,
+                        value=reaction,
+                        category="neutral",
+                    )
+                )
+            elif isinstance(reaction, ReactionEmoji) and reaction.emoticon in default_emojis:
+                candidates.append(
+                    ReactionCandidate(
+                        kind="emoji",
+                        emoji=reaction.emoticon,
+                        value=reaction,
+                        category=reaction_category(reaction.emoticon),
+                    )
+                )
+        return candidates
+
+    async def send_reactions(
+        self,
+        event: ChannelMessageEvent,
+        reactions: list[ReactionCandidate],
+        *,
+        max_reactions: int,
+        fallback_reactions: list[ReactionCandidate] | tuple[ReactionCandidate, ...] = (),
+    ) -> int | ReactionSendResult:
+        peer = await self.client.get_input_entity(event.chat_id)
+        message = event.message or SimpleNamespace(id=event.message_id, reactions=None)
+        result = await smart_set_telethon_reactions(
+            self.client,
+            peer,
+            message,
+            [reaction.value for reaction in reactions],
+            fallback_reactions=[reaction.value for reaction in fallback_reactions],
+            max_reactions=max_reactions,
+            sleep=self.sleep,
+            send_delay_seconds=self.send_delay_seconds,
+            refresh_message_before_send=self.refresh_message_before_send,
+            return_sent_reactions=True,
+        )
+        if not isinstance(result, TelethonReactionSendResult):
+            return result
+        candidates = [*reactions, *list(fallback_reactions)]
+        if 0 <= result.count < max_reactions:
+            fresh_candidates = await self.available_reactions(event.chat_id)
+            sent_identifiers = {
+                ident
+                for reaction in result.reactions
+                if (ident := telethon_reaction_identifier(reaction)) is not None
+            }
+            fresh_candidates = [
+                candidate
+                for candidate in fresh_candidates
+                if telethon_reaction_identifier(candidate.value) not in sent_identifiers
+            ]
+            logger.info(
+                "channel_reaction_underfill_refresh chat_id=%s sent=%s max=%s fresh_candidates=%s",
+                event.chat_id,
+                result.count,
+                max_reactions,
+                len(fresh_candidates),
+            )
+            if fresh_candidates:
+                retry = await smart_set_telethon_reactions(
+                    self.client,
+                    peer,
+                    message,
+                    [reaction.value for reaction in fresh_candidates],
+                    max_reactions=max_reactions,
+                    sleep=self.sleep,
+                    send_delay_seconds=0,
+                    refresh_message_before_send=self.refresh_message_before_send,
+                    return_sent_reactions=True,
+                )
+                if isinstance(retry, TelethonReactionSendResult) and retry.count > 0:
+                    result = self._merge_telethon_reaction_send_results(
+                        result,
+                        retry,
+                        max_reactions=max_reactions,
+                    )
+                    logger.info(
+                        "channel_reaction_underfill_recovered chat_id=%s retry_sent=%s total=%s",
+                        event.chat_id,
+                        retry.count,
+                        result.count,
+                    )
+                    candidates.extend(fresh_candidates)
+        return self._reaction_send_result_from_telethon(
+            result,
+            candidates,
+        )
+
+    @staticmethod
+    def _merge_telethon_reaction_send_results(
+        first: TelethonReactionSendResult,
+        second: TelethonReactionSendResult,
+        *,
+        max_reactions: int,
+    ) -> TelethonReactionSendResult:
+        reactions: list[Any] = []
+        seen: set[object] = set()
+        for reaction in [*first.reactions, *second.reactions]:
+            identifier = telethon_reaction_identifier(reaction)
+            if identifier is None or identifier in seen:
+                continue
+            reactions.append(reaction)
+            seen.add(identifier)
+        return TelethonReactionSendResult(
+            min(max_reactions, len(reactions)),
+            tuple(reactions[:max_reactions]),
+        )
+
+    @staticmethod
+    def _reaction_send_result_from_telethon(
+        result: TelethonReactionSendResult,
+        candidates: list[ReactionCandidate],
+    ) -> ReactionSendResult:
+        keys_by_identifier: dict[object, tuple[str, str]] = {}
+        for candidate in candidates:
+            identifier = telethon_reaction_identifier(candidate.value)
+            if identifier is not None and identifier not in keys_by_identifier:
+                keys_by_identifier[identifier] = reaction_candidate_key(candidate)
+
+        reaction_keys: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for reaction in result.reactions:
+            identifier = telethon_reaction_identifier(reaction)
+            key = keys_by_identifier.get(identifier)
+            if key is None or key in seen:
+                continue
+            reaction_keys.append(key)
+            seen.add(key)
+        return ReactionSendResult(result.count, tuple(reaction_keys))
+
+
+class CachedTelethonChannelReactionSender:
+    def __init__(self, sender: Any, state: Any):
+        self.sender = sender
+        self.state = state
+
+    async def available_reactions(self, chat_id: int) -> list[ReactionCandidate]:
+        if self.state.has_reaction_channel_available_reactions_checked(chat_id):
+            return [
+                candidate
+                for reaction in self.state.list_reaction_channel_available_reactions(chat_id)
+                if (candidate := telethon_reaction_candidate_from_cache(reaction)) is not None
+            ]
+        return await self.sender.available_reactions(chat_id)
+
+    async def send_reactions(
+        self,
+        event: ChannelMessageEvent,
+        reactions: list[ReactionCandidate],
+        *,
+        max_reactions: int,
+        fallback_reactions: list[ReactionCandidate] | tuple[ReactionCandidate, ...] = (),
+    ) -> int | ReactionSendResult:
+        return await self.sender.send_reactions(
+            event,
+            reactions,
+            max_reactions=max_reactions,
+            fallback_reactions=fallback_reactions,
+        )
+
+
+def is_paid_telethon_reaction(reaction: Any) -> bool:
+    from telethon.tl.types import ReactionPaid
+
+    return isinstance(reaction, ReactionPaid)
+
+
+@dataclass(frozen=True)
+class TelethonReactionSendResult:
+    count: int
+    reactions: tuple[Any, ...] = ()
+
+
+def telethon_reaction_identifier(reaction: Any) -> object | None:
+    from telethon.tl.types import ReactionCustomEmoji, ReactionEmoji
+
+    if isinstance(reaction, ReactionCustomEmoji):
+        return reaction.document_id
+    if isinstance(reaction, ReactionEmoji):
+        return reaction.emoticon
+    return None
+
+
+STANDARD_REACTION_DIVERSITY_FAMILIES: dict[str, frozenset[str]] = {
+    "❤": frozenset({"heart"}),
+    "❤‍🔥": frozenset({"heart", "fire"}),
+    "💘": frozenset({"heart"}),
+    "💔": frozenset({"heart", "sad"}),
+    "🔥": frozenset({"fire"}),
+    "👍": frozenset({"positive_hand"}),
+    "👏": frozenset({"positive_hand"}),
+    "👌": frozenset({"positive_hand"}),
+    "🙏": frozenset({"positive_hand"}),
+    "🤝": frozenset({"positive_hand"}),
+    "👎": frozenset({"negative_hand"}),
+    "🖕": frozenset({"negative_hand"}),
+    "😁": frozenset({"happy_face"}),
+    "🤣": frozenset({"happy_face"}),
+    "🤩": frozenset({"happy_face", "star"}),
+    "⭐": frozenset({"star"}),
+    "😇": frozenset({"happy_face"}),
+    "🤗": frozenset({"happy_face"}),
+    "🥰": frozenset({"love_face"}),
+    "😍": frozenset({"love_face"}),
+    "😘": frozenset({"love_face", "kiss"}),
+    "💋": frozenset({"kiss"}),
+    "🤯": frozenset({"shock_attention"}),
+    "😱": frozenset({"shock_attention"}),
+    "😨": frozenset({"shock_attention"}),
+    "👀": frozenset({"shock_attention"}),
+    "🎉": frozenset({"celebration"}),
+    "🏆": frozenset({"celebration"}),
+    "🍾": frozenset({"celebration"}),
+    "😭": frozenset({"sad"}),
+    "😢": frozenset({"sad"}),
+    "🤬": frozenset({"angry"}),
+    "😡": frozenset({"angry"}),
+    "🤮": frozenset({"disgust"}),
+    "🤔": frozenset({"thinking"}),
+    "🤨": frozenset({"thinking"}),
+    "😐": frozenset({"neutral_face"}),
+    "🥱": frozenset({"tired_face"}),
+    "😴": frozenset({"tired_face"}),
+    "🥴": frozenset({"dizzy_face"}),
+    "😎": frozenset({"cool_face"}),
+    "🆒": frozenset({"cool_face"}),
+    "🤪": frozenset({"silly_face"}),
+    "🤓": frozenset({"nerd_face"}),
+    "💩": frozenset({"gross"}),
+    "🤡": frozenset({"weird"}),
+    "🗿": frozenset({"weird"}),
+    "🌚": frozenset({"weird"}),
+    "😈": frozenset({"devil"}),
+    "👻": frozenset({"spooky"}),
+    "🎃": frozenset({"spooky"}),
+    "👾": frozenset({"spooky"}),
+    "🙈": frozenset({"monkey"}),
+    "🙉": frozenset({"monkey"}),
+    "🙊": frozenset({"monkey"}),
+    "🐳": frozenset({"animal"}),
+    "🦄": frozenset({"animal"}),
+    "🍌": frozenset({"food"}),
+    "🌭": frozenset({"food"}),
+    "🍓": frozenset({"food"}),
+    "🎅": frozenset({"holiday"}),
+    "🎄": frozenset({"holiday"}),
+    "☃": frozenset({"holiday"}),
+    "⚡": frozenset({"energy"}),
+    "💯": frozenset({"approval"}),
+    "🕊": frozenset({"peace"}),
+    "💊": frozenset({"medical"}),
+    "👨‍💻": frozenset({"work"}),
+    "✍": frozenset({"writing"}),
+    "💅": frozenset({"beauty"}),
+    "🫡": frozenset({"salute"}),
+    "🤷": frozenset({"shrug"}),
+    "🤷‍♂": frozenset({"shrug"}),
+    "🤷‍♀": frozenset({"shrug"}),
+}
+
+
+def telethon_reaction_diversity_families(reaction: Any) -> frozenset[str]:
+    ident = telethon_reaction_identifier(reaction)
+    if not isinstance(ident, str):
+        return frozenset()
+    return STANDARD_REACTION_DIVERSITY_FAMILIES.get(ident, frozenset())
+
+
+def message_installed_telethon_reaction_count(message: Any) -> int:
+    reactions = getattr(message, "reactions", None)
+    if reactions is None or not hasattr(reactions, "results"):
+        return 0
+    return sum(
+        1
+        for reaction_count in reactions.results
+        if getattr(reaction_count, "chosen_order", None) is not None
+    )
+
+
+def message_has_installed_telethon_reaction(message: Any) -> bool:
+    return message_installed_telethon_reaction_count(message) > 0
+
+
+def order_telethon_reactions_for_diversity(
+    reactions: list[Any],
+    *,
+    visible_ids: set[object],
+    visible_reactions: list[Any],
+) -> list[Any]:
+    used_families: set[str] = set()
+    for reaction in visible_reactions:
+        used_families.update(telethon_reaction_diversity_families(reaction))
+
+    unseen_reactions = [
+        reaction
+        for reaction in reactions
+        if telethon_reaction_identifier(reaction) not in visible_ids
+    ]
+    visible_candidates = [
+        reaction
+        for reaction in reactions
+        if telethon_reaction_identifier(reaction) in visible_ids
+    ]
+
+    ordered: list[Any] = []
+    remaining = list(unseen_reactions)
+    while remaining:
+        distinct_index = next(
+            (
+                index
+                for index, reaction in enumerate(remaining)
+                if not (telethon_reaction_diversity_families(reaction) & used_families)
+            ),
+            None,
+        )
+        if distinct_index is None:
+            distinct_index = 0
+        reaction = remaining.pop(distinct_index)
+        ordered.append(reaction)
+        used_families.update(telethon_reaction_diversity_families(reaction))
+    return [*ordered, *visible_candidates]
+
+
+def telethon_reaction_candidate_from_cache(reaction: dict[str, str]) -> ReactionCandidate | None:
+    from telethon.tl.types import ReactionCustomEmoji, ReactionEmoji
+
+    kind = str(reaction.get("kind") or "emoji")
+    emoji = str(reaction.get("emoji") or "")
+    category = str(reaction.get("category") or reaction_category(emoji))
+    if kind == "emoji":
+        return ReactionCandidate(
+            kind="emoji",
+            emoji=emoji,
+            value=ReactionEmoji(emoticon=emoji),
+            category=category,
+        )
+    if kind in {"custom", "premium"}:
+        try:
+            document_id = int(emoji)
+        except ValueError:
+            return None
+        return ReactionCandidate(
+            kind="custom",
+            emoji=emoji,
+            value=ReactionCustomEmoji(document_id=document_id),
+            category=category,
+        )
+    return None
+
+
+async def refresh_telethon_message_for_reactions(client: Any, peer: Any, message: Any) -> Any:
+    get_messages = getattr(client, "get_messages", None)
+    if get_messages is None:
+        return message
+    fresh_message = await get_messages(peer, ids=int(message.id))
+    return fresh_message or message
+
+
+async def smart_set_telethon_reactions(
+    client: Any,
+    peer: Any,
+    message: Any,
+    selected_reactions: list[Any],
+    *,
+    fallback_reactions: list[Any] | tuple[Any, ...] = (),
+    max_reactions: int = 3,
+    sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+    send_delay_seconds: float = 7.0,
+    refresh_message_before_send: bool = True,
+    return_sent_reactions: bool = False,
+) -> int | TelethonReactionSendResult:
+    from telethon.tl.functions.messages import SendReactionRequest
+
+    def result(count: int, reactions: list[Any] | tuple[Any, ...] = ()) -> int | TelethonReactionSendResult:
+        normalized_count = max(0, int(count))
+        if return_sent_reactions:
+            return TelethonReactionSendResult(normalized_count, tuple(reactions))
+        return normalized_count
+
+    if send_delay_seconds > 0:
+        await sleep(send_delay_seconds)
+    if refresh_message_before_send:
+        message = await refresh_telethon_message_for_reactions(client, peer, message)
+
+    installed_ids = set()
+    visible_ids = set()
+    visible_reactions = []
+    installed_reactions = []
+    if getattr(message, "reactions", None) and hasattr(message.reactions, "results"):
+        for reaction_count in message.reactions.results:
+            ident = telethon_reaction_identifier(reaction_count.reaction)
+            if ident is not None:
+                visible_ids.add(ident)
+                visible_reactions.append(reaction_count.reaction)
+            chosen_order = getattr(reaction_count, "chosen_order", None)
+            if chosen_order is None:
+                continue
+            if ident is not None:
+                installed_ids.add(ident)
+                installed_reactions.append((int(chosen_order), reaction_count.reaction))
+
+    installed_reactions = [
+        reaction
+        for _, reaction in sorted(installed_reactions, key=lambda item: item[0])
+    ][:max_reactions]
+    open_slots = max(0, max_reactions - len(installed_reactions))
+    if open_slots <= 0:
+        return result(0)
+
+    selected_unique, seen_candidate_ids = unique_telethon_reactions(selected_reactions, installed_ids)
+    fallback_unique, _ = unique_telethon_reactions(
+        list(fallback_reactions),
+        installed_ids | seen_candidate_ids,
+    )
+    fallback_ids = {
+        ident
+        for reaction in fallback_unique
+        if (ident := telethon_reaction_identifier(reaction)) is not None
+    }
+    visible_fallback_unique, _ = unique_telethon_reactions(
+        visible_reactions,
+        installed_ids | seen_candidate_ids | fallback_ids,
+    )
+    candidate_queue = [*selected_unique, *fallback_unique, *visible_fallback_unique]
+    candidate_queue = order_telethon_reactions_for_diversity(
+        candidate_queue,
+        visible_ids=visible_ids,
+        visible_reactions=visible_reactions,
+    )
+    target_count = min(open_slots, len(candidate_queue))
+    active_reactions = candidate_queue[:target_count]
+    fallback_queue = candidate_queue[target_count:]
+    if not active_reactions:
+        return result(0)
+
+    def is_visible_candidate(reaction: Any) -> bool:
+        return telethon_reaction_identifier(reaction) in visible_ids
+
+    def replace_unseen_with_visible_fallback() -> bool:
+        active_index = next(
+            (
+                index
+                for index, reaction in enumerate(active_reactions)
+                if not is_visible_candidate(reaction)
+            ),
+            None,
+        )
+        if active_index is None:
+            return False
+        fallback_index = next(
+            (
+                index
+                for index, reaction in enumerate(fallback_queue)
+                if is_visible_candidate(reaction)
+            ),
+            None,
+        )
+        if fallback_index is None:
+            return False
+        active_reactions[active_index] = fallback_queue.pop(fallback_index)
+        return True
+
+    while active_reactions:
+        reaction_vector = [*installed_reactions, *active_reactions]
+        try:
+            await client(
+                SendReactionRequest(peer=peer, msg_id=message.id, reaction=reaction_vector)
+            )
+            return result(len(active_reactions), active_reactions)
+        except Exception as error:
+            error_text = str(error)
+            if "reactions_uniq_max" in error_text.lower() or "CUSTOM_REACTIONS_TOO_MANY" in error_text.upper():
+                if visible_ids and replace_unseen_with_visible_fallback():
+                    continue
+                if len(active_reactions) <= 1:
+                    return result(0)
+                active_reactions.pop()
+                target_count = len(active_reactions)
+                continue
+            if is_reaction_rejected_error(error_text):
+                active_reactions.pop(0)
+                while fallback_queue and len(active_reactions) < target_count:
+                    active_reactions.append(fallback_queue.pop(0))
+                continue
+            raise
+    return result(0)
+
+
+def unique_telethon_reactions(
+    reactions: list[Any] | tuple[Any, ...],
+    installed_ids: set[object],
+) -> tuple[list[Any], set[object]]:
+    unique: list[Any] = []
+    seen = set(installed_ids)
+    added: set[object] = set()
+    for reaction in reactions:
+        if is_paid_telethon_reaction(reaction):
+            continue
+        ident = telethon_reaction_identifier(reaction)
+        if ident is None or ident in seen:
+            continue
+        unique.append(reaction)
+        seen.add(ident)
+        added.add(ident)
+    return unique, added
+
+
+def is_reaction_rejected_error(error_text: str) -> bool:
+    upper = error_text.upper()
+    return any(
+        marker in upper
+        for marker in (
+            "REACTION_INVALID",
+            "REACTION_EMPTY",
+            "REACTION_FORBIDDEN",
+            "REACTION_NOT_ALLOWED",
+        )
+    )
+
+
 async def dispatch_voice_message(event: Any, registry: FeatureRegistry, context: AssistantContext) -> str | None:
     message = event.message
     if not is_transcribable_message(message):
@@ -448,12 +1382,705 @@ class VoiceQueueWorker:
                 self._queue.task_done()
 
 
-async def run_user_client(settings: Settings) -> None:  # pragma: no cover - integration only
+DEFAULT_CHANNEL_REACTION_QUEUE_MAXSIZE = 100
+CHANNEL_REACTION_HISTORY_FETCH_WAIT_SECONDS = 1.0
+CHANNEL_REACTION_HISTORY_LIMIT_CHOICES = frozenset({1000, 2000, 5000})
+CHANNEL_REACTION_HISTORY_SEND_DELAY_RANGE_SECONDS = (8, 15)
+CHANNEL_REACTION_POST_DISPATCH_DELAY_RANGE_SECONDS = (8, 11)
+
+
+@dataclass(frozen=True)
+class ChannelReactionHistoryBackfillResult:
+    channel_count: int
+    scanned_count: int
+    sent_count: int
+    skipped_count: int
+    limit_per_channel: int | None
+    target_chat_id: int | None = None
+    reaction_count: int = 0
+    failed_count: int = 0
+    already_running: bool = False
+    request_queued: bool = False
+    duplicate_queued: bool = False
+    queue_position: int | None = None
+    skip_reasons: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def queued_count(self) -> int:
+        return self.sent_count
+
+
+@dataclass(frozen=True)
+class ChannelReactionHistoryBackfillRequest:
+    limit_per_channel: int | None
+    chat_id: int | None
+
+
+class ChannelReactionHistoryBackfill:
+    def __init__(
+        self,
+        *,
+        client: Any | None = None,
+        state: Any | None = None,
+        reaction_sender: Any | None = None,
+        history_fetch_wait_seconds: float = CHANNEL_REACTION_HISTORY_FETCH_WAIT_SECONDS,
+        send_delay_range_seconds: tuple[int, int] = CHANNEL_REACTION_HISTORY_SEND_DELAY_RANGE_SECONDS,
+        randint: Callable[[int, int], int] = random.randint,
+        sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+        completion_notifier: Callable[[ChannelReactionHistoryBackfillResult], Awaitable[Any]] | None = None,
+        logger_: logging.Logger | None = None,
+    ) -> None:
+        self._client = client
+        self._state = state
+        self._reaction_sender = reaction_sender
+        self._history_fetch_wait_seconds = float(history_fetch_wait_seconds)
+        self._send_delay_range_seconds = send_delay_range_seconds
+        self._randint = randint
+        self._sleep = sleep
+        self._completion_notifier = completion_notifier
+        self._logger = logger_ or logger
+        self._lock = asyncio.Lock()
+        self._queue_lock = asyncio.Lock()
+        self._queue: deque[ChannelReactionHistoryBackfillRequest] = deque()
+        self._active_request: ChannelReactionHistoryBackfillRequest | None = None
+        self._queue_task: asyncio.Task[None] | None = None
+
+    def bind(self, *, client: Any, state: Any, reaction_sender: Any) -> None:
+        self._client = client
+        self._state = state
+        self._reaction_sender = reaction_sender
+
+    def set_completion_notifier(
+        self,
+        notifier: Callable[[ChannelReactionHistoryBackfillResult], Awaitable[Any]] | None,
+    ) -> None:
+        self._completion_notifier = notifier
+
+    async def enqueue_recent_posts(
+        self,
+        *,
+        limit_per_channel: int | None,
+        chat_id: int | None = None,
+    ) -> ChannelReactionHistoryBackfillResult:
+        return await self.enqueue_history(limit_per_channel=limit_per_channel, chat_id=chat_id)
+
+    async def enqueue_history(
+        self,
+        *,
+        limit_per_channel: int | None,
+        chat_id: int | None = None,
+    ) -> ChannelReactionHistoryBackfillResult:
+        if self._client is None or self._state is None or self._reaction_sender is None:
+            raise RuntimeError("Telegram user client недоступен.")
+
+        limit = self._normalize_limit(limit_per_channel)
+        target_chat_id = int(chat_id) if chat_id is not None else None
+        channel_count = len(self._target_channel_ids(target_chat_id))
+        if channel_count <= 0:
+            return ChannelReactionHistoryBackfillResult(
+                channel_count=0,
+                scanned_count=0,
+                sent_count=0,
+                skipped_count=0,
+                limit_per_channel=limit,
+                target_chat_id=target_chat_id,
+            )
+
+        request = ChannelReactionHistoryBackfillRequest(
+            limit_per_channel=limit,
+            chat_id=target_chat_id,
+        )
+        async with self._queue_lock:
+            duplicate_position = self._request_queue_position_locked(request)
+            if duplicate_position is not None:
+                return ChannelReactionHistoryBackfillResult(
+                    channel_count=channel_count,
+                    scanned_count=0,
+                    sent_count=0,
+                    skipped_count=0,
+                    limit_per_channel=limit,
+                    target_chat_id=target_chat_id,
+                    request_queued=True,
+                    duplicate_queued=True,
+                    queue_position=duplicate_position,
+                )
+
+            self._queue.append(request)
+            queue_position = self._request_queue_position_locked(request) or len(self._queue)
+            if self._queue_task is None or self._queue_task.done():
+                self._queue_task = asyncio.create_task(
+                    self._run_history_queue(),
+                    name="channel-reaction-history-queue",
+                )
+
+        self._logger.info(
+            "channel_reaction_history_enqueued chat_id=%s limit=%s position=%s channel_count=%s",
+            target_chat_id,
+            limit,
+            queue_position,
+            channel_count,
+        )
+        return ChannelReactionHistoryBackfillResult(
+            channel_count=channel_count,
+            scanned_count=0,
+            sent_count=0,
+            skipped_count=0,
+            limit_per_channel=limit,
+            target_chat_id=target_chat_id,
+            request_queued=True,
+            queue_position=queue_position,
+        )
+
+    async def wait_history_queue_idle(self) -> None:
+        task = self._queue_task
+        if task is not None:
+            await task
+
+    def _request_queue_position_locked(self, request: ChannelReactionHistoryBackfillRequest) -> int | None:
+        if self._active_request == request:
+            return 1
+        offset = 1 if self._active_request is not None else 0
+        for index, queued_request in enumerate(self._queue, start=offset + 1):
+            if queued_request == request:
+                return index
+        return None
+
+    async def _run_history_queue(self) -> None:
+        while True:
+            async with self._queue_lock:
+                if not self._queue:
+                    self._active_request = None
+                    self._queue_task = None
+                    return
+                request = self._queue.popleft()
+                self._active_request = request
+
+            try:
+                self._logger.info(
+                    "channel_reaction_history_job_started chat_id=%s limit=%s",
+                    request.chat_id,
+                    request.limit_per_channel,
+                )
+                async with self._lock:
+                    result = await self._process_history_locked(
+                        limit_per_channel=request.limit_per_channel,
+                        chat_id=request.chat_id,
+                    )
+                self._logger.info(
+                    "channel_reaction_history_job_complete chat_id=%s limit=%s scanned=%s sent=%s reactions=%s skipped=%s failed=%s",
+                    request.chat_id,
+                    request.limit_per_channel,
+                    result.scanned_count,
+                    result.sent_count,
+                    result.reaction_count,
+                    result.skipped_count,
+                    result.failed_count,
+                )
+                await self._notify_history_completion(result)
+            except Exception:
+                self._logger.exception(
+                    "channel_reaction_history_job_failed chat_id=%s limit=%s",
+                    request.chat_id,
+                    request.limit_per_channel,
+                )
+                await self._notify_history_completion(
+                    ChannelReactionHistoryBackfillResult(
+                        channel_count=0,
+                        scanned_count=0,
+                        sent_count=0,
+                        skipped_count=0,
+                        failed_count=1,
+                        limit_per_channel=request.limit_per_channel,
+                        target_chat_id=request.chat_id,
+                    )
+                )
+            finally:
+                async with self._queue_lock:
+                    if self._active_request == request:
+                        self._active_request = None
+
+    async def _notify_history_completion(self, result: ChannelReactionHistoryBackfillResult) -> None:
+        if self._completion_notifier is None:
+            return
+        try:
+            await self._completion_notifier(result)
+        except Exception:
+            self._logger.exception(
+                "channel_reaction_history_completion_notify_failed chat_id=%s limit=%s",
+                result.target_chat_id,
+                result.limit_per_channel,
+            )
+
+    async def process_history(
+        self,
+        *,
+        limit_per_channel: int | None,
+        chat_id: int | None = None,
+    ) -> ChannelReactionHistoryBackfillResult:
+        limit = self._normalize_limit(limit_per_channel)
+        target_chat_id = int(chat_id) if chat_id is not None else None
+        if self._lock.locked():
+            return ChannelReactionHistoryBackfillResult(
+                channel_count=0,
+                scanned_count=0,
+                sent_count=0,
+                skipped_count=0,
+                limit_per_channel=limit,
+                target_chat_id=target_chat_id,
+                already_running=True,
+                skip_reasons={},
+            )
+        async with self._lock:
+            return await self._process_history_locked(limit_per_channel=limit, chat_id=target_chat_id)
+
+    async def _process_history_locked(
+        self,
+        *,
+        limit_per_channel: int | None,
+        chat_id: int | None,
+    ) -> ChannelReactionHistoryBackfillResult:
+        if self._client is None or self._state is None or self._reaction_sender is None:
+            raise RuntimeError("Telegram user client недоступен.")
+
+        channel_ids = self._target_channel_ids(chat_id)
+        scanned_count = 0
+        sent_count = 0
+        reaction_count = 0
+        skipped_count = 0
+        failed_count = 0
+        skip_reasons: Counter[str] = Counter()
+        last_random_reaction_keys_by_chat: dict[int, frozenset[tuple[str, str]]] = {}
+        handled_media_groups_in_run: set[tuple[int, int]] = set()
+        manual_target = chat_id is not None
+        for target_chat_id in channel_ids:
+            channel_scanned_before = scanned_count
+            channel_sent_before = sent_count
+            channel_reaction_before = reaction_count
+            channel_skipped_before = skipped_count
+            channel_failed_before = failed_count
+            channel_skip_reasons: Counter[str] = Counter()
+            try:
+                settings = self._state.get_effective_reaction_channel_settings(target_chat_id)
+                if settings is None or (not settings.enabled and not manual_target):
+                    continue
+                if not settings.enabled and manual_target:
+                    settings = replace(settings, enabled=True)
+                available = await self._available_reactions(target_chat_id)
+                is_premium = self._state.is_account_premium()
+                max_reactions = effective_max_reactions(settings, is_premium=is_premium)
+                target_ordered = order_reaction_candidates(
+                    available,
+                    settings,
+                    is_premium=is_premium,
+                    chooser=lambda reactions: reactions,
+                )
+                target_reaction_count = min(max_reactions, len(target_ordered))
+                target_count = 0
+                async for message in self._client.iter_messages(
+                    target_chat_id,
+                    limit=None,
+                    wait_time=self._history_fetch_wait_seconds,
+                ):
+                    scanned_count += 1
+                    event = self._history_event(target_chat_id, message)
+                    grouped_id = getattr(message, "grouped_id", None)
+                    media_group_key = (
+                        (target_chat_id, int(grouped_id))
+                        if grouped_id is not None
+                        else None
+                    )
+                    skip_reason = (
+                        "media_group_duplicate"
+                        if media_group_key in handled_media_groups_in_run
+                        else self._history_skip_reason(
+                            event,
+                            allow_disabled_channel=manual_target,
+                            target_reaction_count=target_reaction_count,
+                        )
+                    )
+                    if skip_reason is not None:
+                        if (
+                            media_group_key is not None
+                            and skip_reason in {"already_processed", "media_group_duplicate"}
+                        ):
+                            handled_media_groups_in_run.add(media_group_key)
+                        skip_reasons[skip_reason] += 1
+                        channel_skip_reasons[skip_reason] += 1
+                        skipped_count += 1
+                        continue
+                    target_count += 1
+                    channel_event = build_channel_message_event(event)
+                    ordered = order_reaction_candidates(
+                        available,
+                        settings,
+                        is_premium=is_premium,
+                    )
+                    avoid_keys = (
+                        last_random_reaction_keys_by_chat.get(target_chat_id)
+                        if settings.selection_strategy == "random"
+                        else None
+                    )
+                    selected = select_from_ordered_reaction_candidates(
+                        ordered,
+                        max_reactions,
+                        avoid_reaction_keys=avoid_keys,
+                    )
+                    if not selected:
+                        skip_reasons["no_reactions_available"] += 1
+                        channel_skip_reasons["no_reactions_available"] += 1
+                        skipped_count += 1
+                        if limit_per_channel is not None and target_count >= limit_per_channel:
+                            break
+                        continue
+                    try:
+                        await self._sleep_before_send()
+                        sent_reactions = await self._reaction_sender.send_reactions(
+                            channel_event,
+                            selected,
+                            max_reactions=max_reactions,
+                            fallback_reactions=fallback_reaction_candidates(ordered, selected),
+                        )
+                    except Exception:
+                        failed_count += 1
+                        self._logger.exception(
+                            "channel_reaction_history_message_failed chat_id=%s message_id=%s",
+                            target_chat_id,
+                            channel_event.message_id,
+                        )
+                        if limit_per_channel is not None and target_count >= limit_per_channel:
+                            break
+                        continue
+                    sent_reaction_count = resolve_sent_reaction_count(sent_reactions, selected)
+                    if sent_reaction_count <= 0:
+                        skip_reasons["no_reactions_sent"] += 1
+                        channel_skip_reasons["no_reactions_sent"] += 1
+                        skipped_count += 1
+                        if limit_per_channel is not None and target_count >= limit_per_channel:
+                            break
+                        continue
+                    reaction_count += sent_reaction_count
+                    if settings.selection_strategy == "random":
+                        actual_reaction_keys = resolve_sent_reaction_keys(sent_reactions)
+                        last_random_reaction_keys_by_chat[target_chat_id] = frozenset(
+                            reaction_candidate_key(reaction)
+                            for reaction in selected
+                        ) if actual_reaction_keys is None else actual_reaction_keys
+                    self._state.mark_processed(
+                        target_chat_id,
+                        channel_event.message_id,
+                        ChannelReactionFeature.name,
+                    )
+                    if channel_event.grouped_id is not None:
+                        handled_media_groups_in_run.add(
+                            (target_chat_id, int(channel_event.grouped_id))
+                        )
+                        self._state.mark_processed(
+                            target_chat_id,
+                            int(channel_event.grouped_id),
+                            ChannelReactionFeature.media_group_feature,
+                        )
+                    sent_count += 1
+                    if limit_per_channel is not None and target_count >= limit_per_channel:
+                        break
+            except Exception:
+                failed_count += 1
+                self._logger.exception("channel_reaction_history_backfill_failed chat_id=%s", target_chat_id)
+            finally:
+                self._logger.info(
+                    "channel_reaction_history_channel_complete chat_id=%s scanned=%s sent=%s reactions=%s skipped=%s failed=%s skip_reasons=%s",
+                    target_chat_id,
+                    scanned_count - channel_scanned_before,
+                    sent_count - channel_sent_before,
+                    reaction_count - channel_reaction_before,
+                    skipped_count - channel_skipped_before,
+                    failed_count - channel_failed_before,
+                    dict(channel_skip_reasons),
+                )
+
+        return ChannelReactionHistoryBackfillResult(
+            channel_count=len(channel_ids),
+            scanned_count=scanned_count,
+            sent_count=sent_count,
+            reaction_count=reaction_count,
+            skipped_count=skipped_count,
+            failed_count=failed_count,
+            limit_per_channel=limit_per_channel,
+            target_chat_id=chat_id,
+            skip_reasons=dict(skip_reasons),
+        )
+
+    @staticmethod
+    def _normalize_limit(limit_per_channel: int | None) -> int | None:
+        if limit_per_channel is None:
+            return None
+        limit = int(limit_per_channel)
+        if limit not in CHANNEL_REACTION_HISTORY_LIMIT_CHOICES:
+            raise ValueError("limit_per_channel must be 1000, 2000, 5000 or None")
+        return limit
+
+    async def _sleep_before_send(self) -> None:
+        minimum, maximum = self._send_delay_range_seconds
+        if minimum < 0 or maximum < minimum:
+            minimum, maximum = CHANNEL_REACTION_HISTORY_SEND_DELAY_RANGE_SECONDS
+        await self._sleep(self._randint(int(minimum), int(maximum)))
+
+    async def _available_reactions(self, chat_id: int) -> list[ReactionCandidate]:
+        cached = self._cached_available_reactions(chat_id)
+        if cached is not None:
+            return cached
+        available = await self._reaction_sender.available_reactions(chat_id)
+        self._state.replace_reaction_channel_available_reactions(chat_id, available)
+        return available
+
+    def _cached_available_reactions(self, chat_id: int) -> list[ReactionCandidate] | None:
+        if not self._state.has_reaction_channel_available_reactions_checked(chat_id):
+            return None
+        return [
+            candidate
+            for reaction in self._state.list_reaction_channel_available_reactions(chat_id)
+            if (candidate := self._reaction_candidate_from_cache(reaction)) is not None
+        ]
+
+    @staticmethod
+    def _reaction_candidate_from_cache(reaction: dict[str, str]) -> ReactionCandidate | None:
+        return telethon_reaction_candidate_from_cache(reaction)
+
+    def _target_channel_ids(self, chat_id: int | None) -> list[int]:
+        if not self._state.is_reaction_autolike_enabled():
+            return []
+        if chat_id is not None:
+            settings = self._state.get_effective_reaction_channel_settings(int(chat_id))
+            return [int(chat_id)] if settings is not None else []
+
+        chat_ids: list[int] = []
+        seen: set[int] = set()
+
+        def add(value: Any) -> None:
+            channel_id = int(value)
+            if channel_id not in seen:
+                seen.add(channel_id)
+                chat_ids.append(channel_id)
+
+        for channel in self._state.list_reaction_channels():
+            add(channel["chat_id"])
+        for chat in self._state.list_known_chats(kind="channel"):
+            add(chat["chat_id"])
+        for folder in self._state.list_reaction_folders():
+            for channel in self._state.list_reaction_folder_channels(int(folder["folder_id"])):
+                add(channel["chat_id"])
+
+        enabled_ids: list[int] = []
+        for channel_id in chat_ids:
+            settings = self._state.get_effective_reaction_channel_settings(channel_id)
+            if settings is not None and settings.enabled:
+                enabled_ids.append(channel_id)
+        return enabled_ids
+
+    @staticmethod
+    def _history_event(chat_id: int, message: Any) -> Any:
+        return SimpleNamespace(
+            chat_id=int(chat_id),
+            message=message,
+            is_channel=True,
+            is_group=False,
+            is_private=False,
+            chat=None,
+        )
+
+    def _history_skip_reason(
+        self,
+        event: Any,
+        *,
+        allow_disabled_channel: bool = False,
+        target_reaction_count: int | None = None,
+    ) -> str | None:
+        if not is_reactable_channel_message(event):
+            return "service_message" if getattr(event.message, "action", None) is not None else "not_reactable"
+        if not self._state.is_reaction_autolike_enabled():
+            return "global_disabled"
+        settings = self._state.get_effective_reaction_channel_settings(int(event.chat_id))
+        if settings is None or (not settings.enabled and not allow_disabled_channel):
+            return "channel_disabled"
+        message = event.message
+        message_id = int(message.id)
+        installed_reaction_count = message_installed_telethon_reaction_count(message)
+        if target_reaction_count is None:
+            target_reaction_count = effective_max_reactions(
+                settings,
+                is_premium=self._state.is_account_premium(),
+            )
+        has_enough_installed_reactions = (
+            target_reaction_count > 0 and installed_reaction_count >= target_reaction_count
+        )
+        if (
+            self._state.is_processed(int(event.chat_id), message_id, ChannelReactionFeature.name)
+            and has_enough_installed_reactions
+        ):
+            return "already_processed"
+        grouped_id = getattr(message, "grouped_id", None)
+        if (
+            grouped_id is not None
+            and self._state.is_processed(
+                int(event.chat_id),
+                int(grouped_id),
+                ChannelReactionFeature.media_group_feature,
+            )
+            and has_enough_installed_reactions
+        ):
+            return "media_group_duplicate"
+        return None
+
+
+class ChannelReactionQueueWorker:
+    def __init__(
+        self,
+        handler: Callable[[Any], Awaitable[Any]],
+        *,
+        maxsize: int = DEFAULT_CHANNEL_REACTION_QUEUE_MAXSIZE,
+        dedupe_window_size: int = 1000,
+        delay_range_seconds: tuple[int, int] = (300, 900),
+        delay_range_provider: Callable[[], tuple[int, int]] | None = None,
+        post_dispatch_delay_range_seconds: tuple[int, int] = (0, 0),
+        randint: Callable[[int, int], int] = random.randint,
+        sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+        logger_: logging.Logger | None = None,
+    ) -> None:
+        if maxsize <= 0:
+            raise ValueError("maxsize must be a positive integer")
+        if dedupe_window_size <= 0:
+            raise ValueError("dedupe_window_size must be a positive integer")
+        self._handler = handler
+        self._maxsize = maxsize
+        self._dedupe_window_size = dedupe_window_size
+        self._seen_event_keys: OrderedDict[tuple[int, int], None] = OrderedDict()
+        self._pending_tasks: set[asyncio.Task[Any]] = set()
+        self._dispatch_lock = asyncio.Lock()
+        self._delay_range_seconds = delay_range_seconds
+        self._delay_range_provider = delay_range_provider
+        self._post_dispatch_delay_range_seconds = post_dispatch_delay_range_seconds
+        self._randint = randint
+        self._sleep = sleep
+        self._logger = logger_ or logger
+        self.dropped_count = 0
+        self.processed_count = 0
+
+    @property
+    def maxsize(self) -> int:
+        return self._maxsize
+
+    def qsize(self) -> int:
+        self._prune_finished_tasks()
+        return len(self._pending_tasks)
+
+    def submit(self, event: Any) -> bool:
+        self._prune_finished_tasks()
+        event_key = self._event_key(event)
+        if event_key in self._seen_event_keys:
+            self._logger.info(
+                "channel_reaction_duplicate_skipped chat_id=%s message_id=%s",
+                event_key[0],
+                event_key[1],
+            )
+            return False
+        if len(self._pending_tasks) >= self._maxsize:
+            self.dropped_count += 1
+            self._logger.warning(
+                "channel_reaction_dropped_queue_full chat_id=%s message_id=%s queue_size=%s",
+                getattr(event, "chat_id", "?"),
+                getattr(getattr(event, "message", None), "id", "?"),
+                self._maxsize,
+            )
+            return False
+        self._remember_event_key(event_key)
+        task = asyncio.create_task(self._run_delayed(event), name="channel-reaction-delayed")
+        self._pending_tasks.add(task)
+        task.add_done_callback(self._pending_tasks.discard)
+        return True
+
+    async def run(self) -> None:
+        try:
+            await asyncio.Future()
+        finally:
+            pending_tasks = tuple(self._pending_tasks)
+            for task in pending_tasks:
+                task.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+    async def _run_delayed(self, event: Any) -> None:
+        try:
+            delay = self._next_delay_seconds()
+            self._logger.info(
+                "channel_reaction_scheduled chat_id=%s message_id=%s delay_seconds=%s pending_count=%s",
+                getattr(event, "chat_id", "?"),
+                getattr(getattr(event, "message", None), "id", "?"),
+                delay,
+                len(self._pending_tasks),
+            )
+            await self._sleep(delay)
+            async with self._dispatch_lock:
+                await self._handler(event)
+                post_dispatch_delay = self._next_post_dispatch_delay_seconds()
+                if post_dispatch_delay > 0:
+                    await self._sleep(post_dispatch_delay)
+            self.processed_count += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._logger.exception(
+                "channel_reaction_consumer_handler_failed chat_id=%s",
+                getattr(event, "chat_id", "?"),
+            )
+
+    def _prune_finished_tasks(self) -> None:
+        for task in tuple(self._pending_tasks):
+            if task.done():
+                self._pending_tasks.discard(task)
+
+    def _next_delay_seconds(self) -> int:
+        minimum, maximum = (
+            self._delay_range_provider()
+            if self._delay_range_provider is not None
+            else self._delay_range_seconds
+        )
+        if minimum < 0 or maximum < minimum:
+            minimum, maximum = self._delay_range_seconds
+        return self._randint(int(minimum), int(maximum))
+
+    def _next_post_dispatch_delay_seconds(self) -> int:
+        minimum, maximum = self._post_dispatch_delay_range_seconds
+        if minimum < 0 or maximum < minimum:
+            return 0
+        return self._randint(int(minimum), int(maximum))
+
+    @staticmethod
+    def _event_key(event: Any) -> tuple[int, int]:
+        return (int(getattr(event, "chat_id")), int(getattr(getattr(event, "message", None), "id")))
+
+    def _remember_event_key(self, event_key: tuple[int, int]) -> None:
+        self._seen_event_keys[event_key] = None
+        self._seen_event_keys.move_to_end(event_key)
+        while len(self._seen_event_keys) > self._dedupe_window_size:
+            self._seen_event_keys.popitem(last=False)
+
+
+async def run_user_client(
+    settings: Settings,
+    *,
+    client: Any | None = None,
+    state: Any | None = None,
+    reaction_history_backfill: ChannelReactionHistoryBackfill | None = None,
+) -> None:  # pragma: no cover - integration only
     from telethon import TelegramClient, events
 
     ensure_session_parent(settings.telegram_session)
-    client = TelegramClient(settings.telegram_session, settings.telegram_api_id, settings.telegram_api_hash)
-    state = SQLiteAssistantRepository(settings.database_path)
+    owns_client = client is None
+    if client is None:
+        client = TelegramClient(settings.telegram_session, settings.telegram_api_id, settings.telegram_api_hash)
+    if state is None:
+        state = SQLiteAssistantRepository(settings.database_path)
+    reaction_sender = TelethonChannelReactionSender(client, send_delay_seconds=0)
+    cached_reaction_sender = CachedTelethonChannelReactionSender(reaction_sender, state)
     context = AssistantContext(
         blacklist=state,
         group_whitelist=state,
@@ -467,33 +2094,60 @@ async def run_user_client(settings: Settings) -> None:  # pragma: no cover - int
             state,
             history_throttle_seconds=settings.private_history_throttle_seconds,
         ),
+        reaction_settings=state,
+        reaction_sender=cached_reaction_sender,
     )
-    registry = FeatureRegistry([VoiceTranscriptionFeature()])
+    registry = FeatureRegistry([VoiceTranscriptionFeature(), ChannelReactionFeature()])
 
     async def handle_voice(event: Any) -> None:
         await dispatch_voice_message(event, registry, context)
 
+    async def handle_channel_reaction(event: Any) -> None:
+        await dispatch_channel_message(event, registry, context)
+
     worker = VoiceQueueWorker(handler=handle_voice)
+    reaction_worker = ChannelReactionQueueWorker(
+        handler=handle_channel_reaction,
+        delay_range_provider=state.get_reaction_delay_range_seconds,
+        post_dispatch_delay_range_seconds=CHANNEL_REACTION_POST_DISPATCH_DELAY_RANGE_SECONDS,
+    )
+    if reaction_history_backfill is not None:
+        reaction_history_backfill.bind(
+            client=client,
+            state=state,
+            reaction_sender=TelethonChannelReactionSender(client, send_delay_seconds=0),
+        )
     consumer_task = asyncio.create_task(worker.run(), name="voice-queue-consumer")
+    reaction_consumer_task = asyncio.create_task(reaction_worker.run(), name="channel-reaction-queue-consumer")
+    premium_refresh_task = asyncio.create_task(
+        refresh_account_premium_status_loop(client, state),
+        name="telegram-premium-refresh",
+    )
 
     @client.on(events.NewMessage())
     async def on_message(event: Any) -> None:
+        await remember_chat_from_event(event, state)
         await remember_group_from_event(event, state)
         # Only voice/video-note events should occupy the queue — text messages
         # would block voice processing for no reason.
         if is_transcribable_message(event.message):
             worker.submit(event)
+        if should_enqueue_channel_reaction(event, state):
+            reaction_worker.submit(event)
 
     try:
         await client.start()
-        await sync_group_catalog(client, state)
+        await record_account_premium_status(client, state)
         await client.run_until_disconnected()
     finally:
-        consumer_task.cancel()
-        try:
-            await consumer_task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001 - graceful shutdown
-            pass
+        for task in (consumer_task, reaction_consumer_task, premium_refresh_task):
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - graceful shutdown
+                pass
+        if owns_client and client.is_connected():
+            await client.disconnect()
 
 
 def main() -> None:  # pragma: no cover - integration only

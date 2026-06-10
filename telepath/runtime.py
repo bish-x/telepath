@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from telepath.features.channel_reactions import ReactionSenderPort, ReactionSettingsPort
 from telepath.features.voice_transcription import (
     BlacklistPort,
     GroupWhitelistPort,
@@ -24,3 +25,5 @@ class AssistantContext:
     settings: SettingsPort
     processed: ProcessedMessagesPort
     private_chat_gate: PrivateChatGatePort
+    reaction_settings: ReactionSettingsPort
+    reaction_sender: ReactionSenderPort

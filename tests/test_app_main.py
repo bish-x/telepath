@@ -27,24 +27,30 @@ class _FakeTask:
         return None
 
 
-async def _fast_user(settings):
+async def _fast_user(settings, **kwargs):
     return None
 
 
-async def _slow_user(settings):
+async def _slow_user(settings, **kwargs):
     await asyncio.sleep(10)
 
 
-async def _fast_manager(settings):
+async def _fast_manager(settings, **kwargs):
     return None
 
 
-async def _failing_user(settings):
+async def _failing_user(settings, **kwargs):
     raise RuntimeError("user client died")
 
 
 def _patch_loaders(monkeypatch, *, user_coro, manager_coro):
+    telegram_client = type(
+        "FakeTelegramClient",
+        (),
+        {"is_connected": lambda self: False, "disconnect": lambda self: None},
+    )()
     monkeypatch.setattr(app_module, "load_settings", lambda: object())
+    monkeypatch.setattr(app_module, "build_telegram_client", lambda settings: telegram_client)
     monkeypatch.setattr(app_module, "run_user_client", user_coro)
     monkeypatch.setattr(app_module, "run_manager_bot", manager_coro)
 

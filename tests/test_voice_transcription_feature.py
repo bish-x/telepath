@@ -5,6 +5,7 @@ import pytest
 
 from telepath.features.voice_transcription import (
     TranscriptionCoordinator,
+    VoiceTranscriptionPendingTimeoutError,
     VoiceTranscriptionUnavailableError,
     VoiceMessageEvent,
     VoiceTooLongError,
@@ -69,10 +70,21 @@ class FakeReplies:
 
 
 class FakeSettings:
-    def __init__(self, enabled=True, prompt="runtime prompt", decoration_enabled=False):
+    def __init__(
+        self,
+        enabled=True,
+        prompt="runtime prompt",
+        decoration_enabled=False,
+        private_min_messages=100,
+        voice_min_duration_seconds=0,
+        private_chat_overrides=None,
+    ):
         self.enabled = enabled
         self.prompt = prompt
         self.decoration_enabled = decoration_enabled
+        self.private_min_messages = private_min_messages
+        self.voice_min_duration_seconds = voice_min_duration_seconds
+        self.private_chat_overrides = private_chat_overrides or {}
 
     def is_feature_enabled(self, name):
         return self.enabled
@@ -82,6 +94,18 @@ class FakeSettings:
 
     def is_transcription_decoration_enabled(self):
         return self.decoration_enabled
+
+    def get_private_chat_min_messages(self):
+        return self.private_min_messages
+
+    def get_voice_min_duration_seconds(self):
+        return self.voice_min_duration_seconds
+
+    def is_private_chat_transcription_enabled(self, chat_id):
+        return self.private_chat_overrides.get(chat_id) is True
+
+    def get_private_chat_transcription_override(self, chat_id):
+        return self.private_chat_overrides.get(chat_id)
 
 
 class FakeProcessed:
@@ -134,6 +158,9 @@ def make_context(
     polisher_error=None,
     decoration_enabled=False,
     private_chat_allowed=True,
+    private_min_messages=100,
+    voice_min_duration_seconds=0,
+    private_chat_overrides=None,
 ):
     return Context(
         FakeBlacklist(blocked or set()),
@@ -141,7 +168,13 @@ def make_context(
         FakeTranscriber(error=transcriber_error, delay_seconds=transcriber_delay_seconds),
         FakePolisher(polished_text=polished_text, error=polisher_error),
         FakeReplies(error=reply_error),
-        FakeSettings(enabled=enabled, decoration_enabled=decoration_enabled),
+        FakeSettings(
+            enabled=enabled,
+            decoration_enabled=decoration_enabled,
+            private_min_messages=private_min_messages,
+            voice_min_duration_seconds=voice_min_duration_seconds,
+            private_chat_overrides=private_chat_overrides,
+        ),
         FakeProcessed(already_processed=already_processed),
         FakePrivateChatGate(private_chat_allowed),
     )
@@ -242,6 +275,50 @@ async def test_voice_feature_skips_private_chats_with_too_few_messages():
     assert context.transcriber.calls == []
     assert context.polisher.calls == []
     assert context.replies.sent == []
+
+
+async def test_voice_feature_uses_configured_private_chat_message_threshold():
+    context = make_context(private_chat_allowed=False, private_min_messages=250)
+    feature = VoiceTranscriptionFeature()
+
+    result = await feature.handle(voice_event(message_id=52), context)
+
+    assert result == "private_chat_too_new"
+    assert context.private_chat_gate.calls == [(100, 250)]
+
+
+async def test_voice_feature_allows_forced_private_chat_without_history_gate():
+    context = make_context(private_chat_allowed=False, private_chat_overrides={100: True})
+    feature = VoiceTranscriptionFeature()
+
+    result = await feature.handle(voice_event(message_id=52), context)
+
+    assert result == "voice_transcribed"
+    assert context.private_chat_gate.calls == []
+    assert context.transcriber.calls == [(100, 52)]
+
+
+async def test_voice_feature_respects_forced_private_chat_disable_before_history_gate():
+    context = make_context(private_chat_allowed=True, private_chat_overrides={100: False})
+    feature = VoiceTranscriptionFeature()
+
+    result = await feature.handle(voice_event(message_id=52), context)
+
+    assert result == "private_chat_disabled"
+    assert context.private_chat_gate.calls == []
+    assert context.transcriber.calls == []
+
+
+async def test_voice_feature_skips_voice_shorter_than_configured_minimum_duration():
+    context = make_context(voice_min_duration_seconds=12)
+    feature = VoiceTranscriptionFeature()
+
+    result = await feature.handle(voice_event(message_id=52, duration_seconds=8), context)
+
+    assert result == "voice_too_short"
+    assert context.transcriber.calls == []
+    assert context.replies.sent == []
+    assert context.processed.mark_processed_calls == [(100, 52, "voice_transcription")]
 
 
 async def test_voice_feature_does_not_check_private_history_for_groups():
@@ -425,6 +502,19 @@ async def test_voice_feature_silently_marks_processed_when_telegram_cannot_trans
     assert context.polisher.calls == []
     assert context.replies.sent == []
     assert context.processed.mark_processed_calls == [(100, 50, "voice_transcription")]
+
+
+async def test_voice_feature_does_not_mark_processed_when_transcription_is_still_pending():
+    context = make_context(transcriber_error=VoiceTranscriptionPendingTimeoutError())
+    feature = VoiceTranscriptionFeature()
+
+    result = await feature.handle(voice_event(duration_seconds=None), context)
+
+    assert result == "transcription_pending_timeout"
+    assert context.transcriber.calls == [(100, 50)]
+    assert context.polisher.calls == []
+    assert context.replies.sent == []
+    assert context.processed.mark_processed_calls == []
 
 
 async def test_voice_feature_silently_marks_processed_when_transcription_text_is_empty():

@@ -21,7 +21,7 @@ class ManagerService:
 
     def handle_command(self, *, user_id: int, text: str) -> str:
         if user_id != self.owner_id:
-            return "Access denied."
+            return "Доступ запрещен."
 
         parts = shlex.split(text.strip())
         if not parts:
@@ -43,68 +43,68 @@ class ManagerService:
         if command == "/list":
             return self._list()
         if command == "/status":
-            return "Assistant manager is running."
-        return f"Unknown command: {command}\n\n{self._help()}"
+            return "Панель управления работает."
+        return f"Неизвестная команда: {command}\n\n{self._help()}"
 
     def _block(self, parts: list[str]) -> str:
         if len(parts) < 2:
-            return "Usage: /block <chat_id> [title]"
+            return "Формат: /block <chat_id> [название]"
         try:
             chat_id = int(parts[1])
         except ValueError:
-            return "Usage: /block <chat_id> [title]"
+            return "Формат: /block <chat_id> [название]"
         title = " ".join(parts[2:]) or None
         self.blacklist.block_chat(chat_id, title)
-        return f"Blocked chat {chat_id}."
+        return f"Чат {chat_id} добавлен в исключения."
 
     def _unblock(self, parts: list[str]) -> str:
         if len(parts) != 2:
-            return "Usage: /unblock <chat_id>"
+            return "Формат: /unblock <chat_id>"
         try:
             chat_id = int(parts[1])
         except ValueError:
-            return "Usage: /unblock <chat_id>"
+            return "Формат: /unblock <chat_id>"
         self.blacklist.unblock_chat(chat_id)
-        return f"Unblocked chat {chat_id}."
+        return f"Чат {chat_id} убран из исключений."
 
     def _list(self) -> str:
         chats = self.blacklist.list_blocked_chats()
         if not chats:
-            return "Blocked chats: none"
-        lines = ["Blocked chats:"]
+            return "Исключения: нет"
+        lines = ["Исключения:"]
         for chat in chats:
-            title = chat["title"] or "(no title)"
+            title = chat["title"] or "без названия"
             lines.append(f"- {chat['chat_id']}: {title}")
         return "\n".join(lines)
 
     def _allow_group(self, parts: list[str]) -> str:
         if len(parts) < 2:
-            return "Usage: /allow_group <chat_id> [title]"
+            return "Формат: /allow_group <chat_id> [название]"
         try:
             chat_id = int(parts[1])
         except ValueError:
-            return "Usage: /allow_group <chat_id> [title]"
+            return "Формат: /allow_group <chat_id> [название]"
         title = " ".join(parts[2:]) or None
         self.blacklist.allow_group(chat_id, title)
-        return f"Allowed group {chat_id}."
+        return f"Группа {chat_id} включена."
 
     def _deny_group(self, parts: list[str]) -> str:
         if len(parts) != 2:
-            return "Usage: /deny_group <chat_id>"
+            return "Формат: /deny_group <chat_id>"
         try:
             chat_id = int(parts[1])
         except ValueError:
-            return "Usage: /deny_group <chat_id>"
+            return "Формат: /deny_group <chat_id>"
         self.blacklist.disallow_group(chat_id)
-        return f"Removed group {chat_id}."
+        return f"Группа {chat_id} выключена."
 
     def _groups(self) -> str:
         groups = self.blacklist.list_allowed_groups()
         if not groups:
-            return "Allowed groups: none"
-        lines = ["Allowed groups:"]
+            return "Включенные группы: нет"
+        lines = ["Включенные группы:"]
         for group in groups:
-            title = group["title"] or "(no title)"
+            title = group["title"] or "без названия"
             lines.append(f"- {group['chat_id']}: {title}")
         return "\n".join(lines)
 
@@ -112,13 +112,13 @@ class ManagerService:
     def _help() -> str:
         return "\n".join(
             [
-                "Commands:",
-                "/block <chat_id> [title] - exclude a private chat from transcription",
-                "/unblock <chat_id> - remove chat from blacklist",
-                "/list - show blocked chats",
-                "/allow_group <chat_id> [title] - enable transcription in a group",
-                "/deny_group <chat_id> - remove group from whitelist",
-                "/groups - show whitelisted groups",
-                "/status - show manager status",
+                "Команды:",
+                "/block <chat_id> [название] - добавить личный чат в исключения",
+                "/unblock <chat_id> - убрать личный чат из исключений",
+                "/list - показать исключения",
+                "/allow_group <chat_id> [название] - включить группу",
+                "/deny_group <chat_id> - выключить группу",
+                "/groups - показать включенные группы",
+                "/status - проверить панель",
             ]
         )

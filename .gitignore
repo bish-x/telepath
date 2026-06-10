@@ -26,4 +26,5 @@ data/
 # Tooling caches and local notes
 .tmp/
 .omc/
+.cdx-compact/
 .DS_Store
