@@ -1,23 +1,52 @@
 # Telepath
 
-> Personal Telegram account assistant with owner-only bot controls and pluggable LLM text polishing.
+Personal Telegram account assistant with an owner-only control bot.
 
-Telepath runs alongside your personal Telegram account, transcribes incoming and outgoing voice messages and video notes using Telegram's own transcription service, polishes the transcripts with an LLM of your choice, and replies in the original chat — wrapped in a premium emoji. A separate owner-only manager bot exposes a button-based control panel so you can toggle features, manage exceptions, and pick which groups are in scope.
+Telepath runs next to your own Telegram account. It can transcribe voice
+messages, polish the transcript with an LLM, export chat history on demand, and
+automatically react to selected channel posts. A separate manager bot gives you
+a button-based control panel, so you can change settings from Telegram instead
+of editing config files.
 
-The architecture is feature-based. Voice transcription is the first capability; future features (chat summaries, reminders, etc.) live under `telepath/features/` and reuse the same Telegram clients, storage, and LLM ports.
+Telepath is not a hosted service. You run it yourself, keep the SQLite state
+locally, and choose which LLM provider, chats, groups, and channels are in
+scope.
 
-## Prerequisites
+## What You Get
 
-Before you start, gather:
+- **Voice transcription** for incoming and outgoing voice messages and video
+  notes, using Telegram's user-account transcription endpoint.
+- **LLM text polishing** through OpenAI, Anthropic, or GitHub Copilot CLI:
+  punctuation, paragraphs, and obvious recognition fixes without rewriting the
+  message.
+- **Owner-only manager bot** for feature toggles, group allowlists, chat
+  export, channel autolike settings, diagnostics, and prompt editing.
+- **Chat history export** from Telegram into `.txt` files, launched from the
+  manager panel with presets and safety confirmations for large exports.
+- **Channel autolike** from your Telegram account with per-channel settings,
+  folder defaults, randomized reactions, Telegram Premium-aware reaction count,
+  fallback handling, and delayed sending.
+- **Local state** in SQLite: processed messages, allowlists, channel reaction
+  settings, cached Telegram folders, available reactions, and chat metadata.
 
-1. **Docker** — Docker Desktop (macOS / Windows) or Docker Engine + Compose v2 (Linux). <https://docs.docker.com/get-docker/>
-2. **Telegram API credentials** — sign in at <https://my.telegram.org/apps> and create an app. Copy `App api_id` and `App api_hash`.
-3. **A manager bot** — open <https://t.me/BotFather>, send `/newbot`, give it a name. Copy the HTTP API token it prints (looks like `1234567890:AAEhBP_...`).
-4. **An LLM API key** — pick one:
-   - **OpenAI**: create a key at <https://platform.openai.com/api-keys>.
-   - **Anthropic**: create a key at <https://console.anthropic.com/settings/keys>.
+## How It Works
+
+Telepath starts two workers in the same process:
+
+1. **User client**: a Telethon client logged in as your Telegram account. It can
+   read messages, request Telegram voice transcriptions, export chat history,
+   inspect channel reaction settings, and send reactions.
+2. **Manager bot**: an aiogram bot that only accepts commands and callbacks from
+   `TG_OWNER_ID`.
+
+The user client owns Telegram account access. The manager bot only changes
+configuration and starts explicit owner-requested actions. Feature modules
+receive narrow ports for storage, LLM calls, replies, and reaction sending, so
+the core behavior stays testable without live Telegram credentials.
 
 ## Quickstart
+
+### 1. Clone and run setup
 
 ```bash
 git clone https://github.com/bish-x/telepath.git
@@ -25,71 +54,85 @@ cd telepath
 ./scripts/setup.sh
 ```
 
-`setup.sh` is interactive and idempotent. It walks you through:
+`setup.sh` is interactive and idempotent. It asks for:
 
-1. Telegram API credentials (`TG_API_ID`, `TG_API_HASH`).
-2. Manager bot token (`TG_MANAGER_BOT_TOKEN`).
-3. LLM provider (OpenAI by default; Anthropic also supported out of the box).
-4. **Telegram user authorization** — the container will ask you for your phone number (international format, e.g. `+1234567890`), the login code Telegram sends to your other devices, and your 2FA password if you have one. Your numeric user id (`TG_OWNER_ID`) is captured automatically and saved to `.env`.
-5. `docker compose up -d` to start the stack.
+- Telegram API credentials from <https://my.telegram.org/apps>
+- a manager bot token from [@BotFather](https://t.me/BotFather)
+- your LLM provider and API key
+- Telegram user authorization for the account Telepath will assist
 
-When it finishes, open Telegram and send `/start` to **your manager bot** (the one you created with @BotFather). Only your account — the one you authorised in step 4 — can use the panel.
+When setup finishes, it starts Docker Compose. Open Telegram, send `/start` to
+your manager bot, and use the panel from there.
 
-Re-run `./scripts/setup.sh` any time to rotate keys or switch the LLM provider. Run `./scripts/auth.sh` if the Telegram session expires or you want to switch accounts.
-
-## Useful commands
+### 2. Useful commands
 
 ```bash
-docker compose logs -f telepath     # tail logs
-docker compose restart telepath     # restart
-docker compose down                 # stop
-./scripts/auth.sh                   # re-authorize Telegram (e.g. session revoked)
-./scripts/setup.sh                  # rotate keys, switch LLM provider
+docker compose logs -f telepath     # follow logs
+docker compose restart telepath     # restart the assistant
+docker compose down                 # stop everything
+./scripts/setup.sh                  # rotate keys or change provider
+./scripts/auth.sh                   # re-authorize the Telegram user session
 ```
 
-## What it does, in detail
+## Configuration
 
-- Runs a Telegram **user client** for account-level access (Telethon-based).
-- Runs a separate **owner-only manager bot** with a button panel (aiogram).
-- Transcribes incoming and outgoing voice messages and video notes through Telegram's user-only transcription endpoint.
-- Polishes the transcript with the configured LLM (Copilot CLI / OpenAI / Anthropic) — punctuation, paragraphs, obvious recognition fixes only; never paraphrases or summarises.
-- Replies in the original chat with the polished text, wrapped in your configured premium emoji.
-- Marks recognised Russian profanity with strikethrough entities (whole-word matches; substrings inside normal words are left alone).
-- Returns the `custom_emoji_id` when the owner sends a premium emoji to the manager bot.
+Copy `.env.example` to `.env` manually, or let `./scripts/setup.sh` fill it.
 
-## Runtime safety rules
+Required values:
 
-- Personal chats are processed only after the user client has seen at least 100 visible messages in that dialog (cached in SQLite).
-- Groups are processed only when explicitly selected via the manager panel.
-- Channels are always skipped.
-- Personal-chat exceptions are skipped.
-- Voice/video notes longer than 5 minutes are skipped.
-- If Telegram returns `MSG_VOICE_TOO_LONG`, `TRANSCRIPTION_FAILED`, or an empty transcript, Telepath skips silently and marks the message processed.
-- Processed message IDs are recorded so reconnects don't trigger duplicate replies.
-- Voice messages are processed **sequentially through a bounded queue** (default capacity 64). One in-flight transcription/polish/reply at a time, FIFO across all chats — protects against Telegram and LLM rate limits. If the queue fills up under a burst, extra events are dropped with a `voice_dropped_queue_full` warning rather than back-pressuring Telethon.
+| Variable | Purpose |
+| --- | --- |
+| `TG_API_ID`, `TG_API_HASH` | Telegram API app credentials for the user client. |
+| `TG_MANAGER_BOT_TOKEN` | BotFather token for the owner-only manager bot. |
+| `TG_OWNER_ID` | Your numeric Telegram user id. `setup.sh` fills it during auth. |
+| `TG_SESSION` | Telethon session path without the `.session` suffix. |
+| `TG_ASSISTANT_DB` | SQLite database path. |
+| `LLM_PROVIDER` | `openai`, `anthropic`, or `copilot`. |
 
-## Manager bot panel
+Provider-specific values:
 
-Only `TG_OWNER_ID` can open and use the panel. Send `/start` or `/menu` to the manager bot.
+| Provider | Required variables | Notes |
+| --- | --- | --- |
+| OpenAI | `OPENAI_API_KEY`, `OPENAI_MODEL` | Works in Docker out of the box. |
+| Anthropic | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` | Works in Docker out of the box. |
+| Copilot CLI | `COPILOT_COMMAND`, `COPILOT_MODEL` | Requires the `copilot` CLI on the host; it is not bundled in the Docker image. |
 
-```text
-Главное меню
-├─ Транскрибация
-│  ├─ Включить / Выключить
-│  ├─ Исключения
-│  │  ├─ Заблокировать чат
-│  │  └─ Разблокировать чат
-│  ├─ Группы
-│  │  ├─ ✅ / ○ toggle для каждой группы
-│  │  └─ Ввести chat_id
-│  └─ Промпт
-│     ├─ Изменить промпт
-│     └─ Сбросить промпт
-├─ Статус
-└─ Помощь
-```
+`OPENAI_BASE_URL` and `ANTHROPIC_BASE_URL` can point to compatible gateways.
 
-Slash commands are still supported as a fallback:
+## Manager Bot
+
+Only `TG_OWNER_ID` can use the manager bot. Routine navigation answers callback
+queries silently; visible Telegram toasts are reserved for meaningful
+long-running actions such as starting a chat export or a channel history job.
+
+Main areas:
+
+- **Transcription**
+  - global on/off switch
+  - personal chat and group scopes
+  - minimum voice duration
+  - private-chat message threshold
+  - prompt editing
+  - diagnostics explaining why a message was skipped
+- **Chat export**
+  - searchable chat picker
+  - preset export limits
+  - manual limit entry
+  - confirmation before heavy exports
+  - `.txt` result sent back by the bot
+- **Channel autolike**
+  - global kill-switch
+  - per-channel settings
+  - Telegram folder defaults
+  - delayed reactions
+  - history backfill queue
+  - available reaction refresh
+  - ordinary, premium/custom, or mixed reaction sources
+- **Status and help**
+  - current runtime settings
+  - quick command reference
+
+Slash commands are still available as a fallback:
 
 ```text
 /block <chat_id> [title]
@@ -101,87 +144,167 @@ Slash commands are still supported as a fallback:
 /status
 ```
 
-Send any premium/custom emoji to the manager bot and it replies with the corresponding `custom_emoji_id`.
+Send a premium/custom emoji to the manager bot and Telepath replies with its
+`custom_emoji_id`, which is useful when configuring custom reaction buttons.
 
-## LLM providers
+## Voice Transcription
 
-Set `LLM_PROVIDER` in `.env` to one of:
+Telepath is conservative by default:
 
-| Provider    | Required env vars                          | Notes                                                                              |
-|-------------|--------------------------------------------|------------------------------------------------------------------------------------|
-| `openai`    | `OPENAI_API_KEY`, `OPENAI_MODEL`           | Works out of the box in Docker. Recommended for first-time setup.                  |
-| `anthropic` | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`     | Works out of the box in Docker.                                                    |
-| `copilot`   | `COPILOT_COMMAND`, `COPILOT_MODEL`         | Requires `copilot` CLI on the host. **Not bundled in the Docker image.**           |
+- personal chats are processed only after the configured visible-message
+  threshold, unless explicitly enabled in the manager panel
+- groups are processed only when explicitly selected
+- channels are skipped by voice transcription
+- personal-chat exceptions are skipped
+- voice/video notes longer than 5 minutes are skipped
+- voice/video notes shorter than the configured minimum duration are skipped
+- Telegram transcription failures and empty transcripts are skipped silently and
+  marked processed
+- voice messages go through a bounded FIFO queue so Telegram and LLM providers
+  are not hit in parallel bursts
 
-`OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` let you point at any compatible endpoint (e.g. a Codex-style proxy or an enterprise gateway).
+The LLM polishing step is intentionally narrow: it fixes transcript readability
+without summarizing, paraphrasing, or changing the meaning.
 
-Adding a new provider takes two files:
+## Channel Autolike
 
-1. A class under `telepath/llm/` implementing `polish(text, prompt) -> str` (see `openai_api.py`).
-2. A branch in `build_polisher()` in `telepath/llm/__init__.py`.
+Channel autolike reacts from your Telegram account, not from the manager bot.
+It is designed for controlled channels and explicit owner configuration.
 
-## Running without Docker
+Core behavior:
 
-If you'd rather run on bare Python (no container), you need Python 3.12+ and either [`uv`](https://docs.astral.sh/uv/) or `pip`:
+- disabled globally by the kill-switch when needed
+- per-channel settings override folder defaults
+- folders can act as defaults for channels without manual settings
+- reaction delay is configurable and defaults to 240-900 seconds
+- delayed jobs read the latest message reactions at send time, not only when
+  the post first appears
+- non-Premium accounts are capped at one automatic reaction
+- Premium accounts can use up to three reactions
+- paid Telegram Star reactions are ignored and never automated
+- already processed history posts are retried when owner reactions were removed
+  or only partially applied
+
+Reaction selection:
+
+- source: ordinary reactions, premium/custom emoji reactions, or mixed
+- mode: positive, negative, all, or manually selected
+- strategy: priority order or random
+- random mode avoids repeating the exact same set on every post when possible
+- visible reactions already present on a post are used as a fallback when
+  Telegram rejects unseen reactions
+- custom/premium emoji reactions can be categorized manually per channel because
+  Telegram does not expose their semantic meaning
+
+History processing:
+
+- available from the manager panel for one channel or all enabled channels
+- batch sizes: 1000, 2000, 5000, or full history
+- albums are handled as one logical post to avoid duplicate reactions
+- jobs are queued so repeated clicks do not run overlapping history scans
+- completion is sent as a separate bot message with metrics
+
+## Chat Export
+
+The manager bot can export readable chat history as a `.txt` document. Exports
+are owner-triggered, not automatic.
+
+The picker supports search and paging. Large exports require explicit
+confirmation so a mistaken button press does not start a long Telegram history
+scan.
+
+## Running Without Docker
+
+Use Python 3.12+.
 
 ```bash
-# with uv (recommended)
+# with uv
 uv venv
 uv pip install -e ".[dev]"
 
-# or with stock pip
+# or with stock Python
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 
-# either way:
-cp .env.example .env       # fill in the values
-telepath-auth              # first-time Telegram authorization
-telepath                   # starts both workers
+cp .env.example .env
+telepath-auth
+telepath
 ```
 
-Or split the workers across processes: `telepath-user` and `telepath-manager`.
+You can also split the workers:
 
-## Project layout
-
+```bash
+telepath-user
+telepath-manager
 ```
+
+## Project Layout
+
+```text
 telepath/
-├── app.py                # entrypoint: runs user client + manager bot together
-├── auth.py               # `telepath-auth` CLI: first-time Telethon authorization
-├── config.py             # env loading and validation
-├── user_client.py        # Telethon-driven user client + event dispatch
-├── manager_bot.py        # aiogram-driven owner-only control bot
-├── panel.py              # button-based control panel
-├── manager.py            # manager service (state changes)
-├── runtime.py            # AssistantContext: the narrow ports each feature receives
-├── features/             # feature modules — voice_transcription, future capabilities
-│   ├── base.py
-│   └── voice_transcription.py
-├── llm/                  # pluggable text polishers
-│   ├── base.py           # TextPolisher Protocol + shared exceptions
-│   ├── copilot_cli.py    # `copilot -p ...` subprocess polisher
-│   ├── openai_api.py     # OpenAI Chat Completions polisher
-│   └── anthropic_api.py  # Anthropic Messages polisher
+├── app.py                         # starts user client and manager bot
+├── auth.py                        # Telegram user authorization CLI
+├── chat_export.py                 # text export of Telegram chat history
+├── config.py                      # environment loading and validation
+├── manager_bot.py                 # aiogram owner-only bot
+├── manager.py                     # state-changing manager service
+├── panel.py                       # manager panel views and actions
+├── runtime.py                     # narrow runtime ports for features
+├── storage.py                     # SQLite repository
+├── user_client.py                 # Telethon user client and queues
+├── features/
+│   ├── channel_reactions.py       # channel autolike domain logic
+│   └── voice_transcription.py     # voice transcription feature
+├── llm/
+│   ├── anthropic_api.py
+│   ├── copilot_cli.py
+│   └── openai_api.py
 ├── premium_emoji.py
 ├── profanity.py
 ├── prompts.py
-├── session_paths.py
-└── storage.py            # SQLite repository: state, exceptions, groups, processed IDs
+└── session_paths.py
 ```
 
 ## Tests
 
 ```bash
-uv run pytest -q
-# or
 pytest -q
 ```
 
-Tests are pure-Python; no Telegram or LLM credentials required (all network calls are mocked through protocol-style ports). The suite enforces 100% coverage on the `telepath/` package.
+The test suite is pure Python. Telegram, Bot API, and LLM calls are mocked
+through narrow ports, so tests do not require real credentials.
 
-## Design boundary
+Coverage settings live in `pyproject.toml`:
 
-The user client owns chat access and transcription. The manager bot only changes configuration. Feature modules receive events and narrow ports, so Telegram clients, storage, and LLM providers can be swapped without rewriting feature behaviour.
+```bash
+coverage run -m pytest
+coverage report
+```
+
+## Security And Privacy Notes
+
+- Keep `.env`, `.session`, and SQLite database files private.
+- The public repository ignores runtime state and session files.
+- The setup script writes credentials only to your local `.env`.
+- Telepath stores operational state in SQLite; it does not send chat history to
+  a backend service.
+- Voice polishing sends transcript text to the LLM provider you configure.
+- Chat exports are explicit owner actions.
+- Telegram account automation can violate expectations if used carelessly. Keep
+  scopes narrow and use the manager panel kill-switches when testing.
+
+## Design Boundary
+
+Telepath intentionally separates account access from configuration:
+
+- Telethon user client: reads Telegram data and performs account actions.
+- Manager bot: owner-only control surface.
+- Feature modules: pure behavior around narrow ports.
+- SQLite repository: local state and idempotency.
+
+That boundary keeps the system testable and makes it easier to add future
+features without coupling them directly to Telegram clients or LLM SDKs.
 
 ## License
 
