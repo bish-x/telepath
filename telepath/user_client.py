@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import json
 import logging
 import random
+import shutil
+import tempfile
 import time
 from collections import Counter, OrderedDict, deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
+
+from telethon import errors as telethon_errors
 
 from telepath.config import Settings, load_settings
 from telepath.features.base import FeatureRegistry
@@ -26,6 +35,12 @@ from telepath.features.channel_reactions import (
     sent_reaction_count as resolve_sent_reaction_count,
     sent_reaction_keys as resolve_sent_reaction_keys,
 )
+from telepath.features.post_mirroring import (
+    PostMirrorEvent,
+    PostMirrorFeature,
+    PostMirrorQueuedDelivery,
+    PostMirrorSendResult,
+)
 from telepath.features.voice_transcription import (
     VoiceTranscriptionPendingTimeoutError,
     VoiceMessageEvent,
@@ -34,6 +49,7 @@ from telepath.features.voice_transcription import (
     VoiceTranscriptionFeature,
 )
 from telepath.llm import build_polisher
+from telepath.presence import mark_current_session_offline
 from telepath.profanity import find_profanity_spans
 from telepath.runtime import AssistantContext
 from telepath.session_paths import ensure_session_parent
@@ -41,6 +57,46 @@ from telepath.storage import SQLiteAssistantRepository
 
 
 logger = logging.getLogger(__name__)
+
+POST_MIRROR_FLOOD_WAIT_EXTRA_SECONDS = 5
+_POST_MIRROR_FLOOD_WAIT_SLEEP: contextvars.ContextVar[
+    Callable[[float], Awaitable[Any]] | None
+] = contextvars.ContextVar("post_mirror_flood_wait_sleep", default=None)
+_POST_MIRROR_REALTIME_YIELD: contextvars.ContextVar[
+    Callable[[], Awaitable[Any]] | None
+] = contextvars.ContextVar("post_mirror_realtime_yield", default=None)
+_POST_MIRROR_INTERRUPTIBLE_HISTORY_AWAIT: contextvars.ContextVar[
+    Callable[[Callable[[], Awaitable[Any]]], Awaitable[Any]] | None
+] = contextvars.ContextVar("post_mirror_interruptible_history_await", default=None)
+
+
+def post_mirror_flood_wait_delay_seconds(error: telethon_errors.FloodWaitError) -> int:
+    return max(1, int(getattr(error, "seconds", 0) or 0)) + POST_MIRROR_FLOOD_WAIT_EXTRA_SECONDS
+
+
+async def _yield_post_mirror_history_to_realtime_if_pending() -> None:
+    callback = _POST_MIRROR_REALTIME_YIELD.get()
+    if callback is not None:
+        await callback()
+
+
+class PostMirrorHistoryPreempted(Exception):
+    pass
+
+
+async def _await_post_mirror_history_interruptibly(factory: Callable[[], Awaitable[Any]]) -> Any:
+    callback = _POST_MIRROR_INTERRUPTIBLE_HISTORY_AWAIT.get()
+    if callback is None:
+        return await factory()
+    return await callback(factory)
+
+
+async def _retry_post_mirror_history_preemptions(factory: Callable[[], Awaitable[Any]]) -> Any:
+    while True:
+        try:
+            return await _await_post_mirror_history_interruptibly(factory)
+        except PostMirrorHistoryPreempted:
+            continue
 
 
 class TelethonTranscriber:
@@ -94,12 +150,20 @@ class TelethonTranscriber:
             apply_update(update)
 
         self.client.add_event_handler(handle_raw_update, events.Raw)
-        peer = await self.client.get_input_entity(chat_id)
+        try:
+            peer = await self.client.get_input_entity(chat_id)
+        finally:
+            await mark_current_session_offline(self.client)
         try:
             for attempt in range(self.empty_timeout_retries + 1):
                 final_text = loop.create_future()
                 try:
-                    result = await self.client(functions.messages.TranscribeAudioRequest(peer=peer, msg_id=message_id))
+                    try:
+                        result = await self.client(
+                            functions.messages.TranscribeAudioRequest(peer=peer, msg_id=message_id)
+                        )
+                    finally:
+                        await mark_current_session_offline(self.client)
                 except errors.BadRequestError as error:
                     message = getattr(error, "message", "")
                     if message == "MSG_VOICE_TOO_LONG":
@@ -214,12 +278,15 @@ class PrivateChatHistoryGate:
     async def _count_visible_messages(self, chat_id: int, minimum_messages: int) -> int:
         count = 0
         fetch_limit = max(minimum_messages, minimum_messages * self._visible_fetch_multiplier)
-        async for message in self.client.iter_messages(chat_id, limit=fetch_limit):
-            if getattr(message, "action", None) is not None:
-                continue
-            count += 1
-            if count >= minimum_messages:
-                break
+        try:
+            async for message in self.client.iter_messages(chat_id, limit=fetch_limit):
+                if getattr(message, "action", None) is not None:
+                    continue
+                count += 1
+                if count >= minimum_messages:
+                    break
+        finally:
+            await mark_current_session_offline(self.client)
         return count
 
 
@@ -230,6 +297,12 @@ class TelethonReplies:
         self.client = client
         self.custom_emoji_id = custom_emoji_id
 
+    async def _send_message(self, *args: Any, **kwargs: Any) -> None:
+        try:
+            await self.client.send_message(*args, **kwargs)
+        finally:
+            await mark_current_session_offline(self.client)
+
     async def reply(self, chat_id: int, message_id: int, text: str, *, decorate: bool = False) -> None:
         from telethon.tl.types import MessageEntityBlockquote, MessageEntityItalic
 
@@ -239,7 +312,7 @@ class TelethonReplies:
                 *profanity_italic_entities(text, MessageEntityItalic),
             ]
             if entities:
-                await self.client.send_message(
+                await self._send_message(
                     chat_id,
                     text,
                     reply_to=message_id,
@@ -247,7 +320,7 @@ class TelethonReplies:
                     parse_mode=None,
                 )
                 return
-            await self.client.send_message(chat_id, text, reply_to=message_id)
+            await self._send_message(chat_id, text, reply_to=message_id)
             return
 
         from telethon.tl.types import MessageEntityCustomEmoji
@@ -265,7 +338,7 @@ class TelethonReplies:
             *transcription_quote_entities(text, MessageEntityBlockquote, utf16_offset=utf16_len(text_prefix)),
             *profanity_italic_entities(text, MessageEntityItalic, utf16_offset=utf16_len(text_prefix)),
         ]
-        await self.client.send_message(
+        await self._send_message(
             chat_id,
             decorated_text,
             reply_to=message_id,
@@ -349,15 +422,18 @@ async def remember_group_from_event(event: Any, repository: Any) -> None:
 async def sync_group_catalog(client: Any, repository: Any) -> None:
     base_seen_at = int(time.time())
     index = 0
-    async for dialog in client.iter_dialogs():
-        if not getattr(dialog, "is_group", False):
-            continue
-        repository.upsert_known_group(
-            int(dialog.id),
-            getattr(dialog, "title", None),
-            last_seen_at=base_seen_at - index,
-        )
-        index += 1
+    try:
+        async for dialog in client.iter_dialogs():
+            if not getattr(dialog, "is_group", False):
+                continue
+            repository.upsert_known_group(
+                int(dialog.id),
+                getattr(dialog, "title", None),
+                last_seen_at=base_seen_at - index,
+            )
+            index += 1
+    finally:
+        await mark_current_session_offline(client)
 
 
 def get_message_duration_seconds(message: Any) -> int | None:
@@ -408,6 +484,21 @@ def build_channel_message_event(event: Any) -> ChannelMessageEvent:
     )
 
 
+def build_post_mirror_event(event: Any) -> PostMirrorEvent:
+    messages = tuple(getattr(event, "messages", None) or (event.message,))
+    first_message = messages[0]
+    grouped_id = getattr(first_message, "grouped_id", None)
+    return PostMirrorEvent(
+        chat_id=int(event.chat_id),
+        message_id=int(first_message.id),
+        message_ids=tuple(int(message.id) for message in messages),
+        is_channel=bool(getattr(event, "is_channel", False)),
+        is_group=bool(getattr(event, "is_group", False)),
+        grouped_id=int(grouped_id) if grouped_id is not None else None,
+        messages=messages,
+    )
+
+
 def is_reactable_channel_message(event: Any) -> bool:
     message = getattr(event, "message", None)
     if getattr(message, "action", None) is not None:
@@ -424,6 +515,29 @@ def should_enqueue_channel_reaction(event: Any, repository: Any) -> bool:
     return bool(settings and settings.enabled)
 
 
+def is_mirrorable_source_message(event: Any) -> bool:
+    message = getattr(event, "message", None)
+    if getattr(message, "action", None) is not None:
+        return False
+    if getattr(message, "grouped_id", None) is not None and not getattr(event, "messages", None):
+        return False
+    return bool(getattr(event, "is_channel", False) or getattr(event, "is_group", False))
+
+
+def should_enqueue_post_mirror(event: Any, repository: Any) -> bool:
+    if not is_mirrorable_source_message(event):
+        return False
+    if not repository.is_post_mirroring_enabled():
+        return False
+    target_chat_id = repository.get_post_mirror_target_chat_id()
+    if target_chat_id is None:
+        return False
+    if int(event.chat_id) == int(target_chat_id):
+        return False
+    settings = repository.get_post_mirror_source_settings(int(event.chat_id))
+    return bool(settings and settings.enabled)
+
+
 def classify_dialog_kind(dialog: Any) -> str:
     if getattr(dialog, "is_user", False):
         return "private"
@@ -434,7 +548,7 @@ def classify_dialog_kind(dialog: Any) -> str:
     return "chat"
 
 
-async def remember_chat_from_event(event: Any, repository: Any) -> None:
+async def remember_chat_from_event(event: Any, repository: Any) -> tuple[str | None, str]:
     kind = "chat"
     if getattr(event, "is_private", False):
         kind = "private"
@@ -457,19 +571,73 @@ async def remember_chat_from_event(event: Any, repository: Any) -> None:
             or getattr(chat, "username", None)
         )
     repository.upsert_known_chat(int(event.chat_id), title, kind, last_seen_at=int(time.time()))
+    return title, kind
 
 
-async def sync_chat_catalog(client: Any, repository: Any) -> None:
+async def sync_chat_catalog(client: Any, repository: Any, *, post_mirror_topic_manager: Any | None = None) -> None:
     base_seen_at = int(time.time())
     index = 0
-    async for dialog in client.iter_dialogs():
-        repository.upsert_known_chat(
-            int(dialog.id),
-            getattr(dialog, "title", None),
-            classify_dialog_kind(dialog),
-            last_seen_at=base_seen_at - index,
-        )
-        index += 1
+    try:
+        async for dialog in client.iter_dialogs():
+            chat_id = int(dialog.id)
+            title = getattr(dialog, "title", None)
+            kind = classify_dialog_kind(dialog)
+            repository.upsert_known_chat(
+                chat_id,
+                title,
+                kind,
+                last_seen_at=base_seen_at - index,
+            )
+            if post_mirror_topic_manager is not None:
+                await sync_post_mirror_topic_title(
+                    state=repository,
+                    topic_manager=post_mirror_topic_manager,
+                    source_chat_id=chat_id,
+                    title=title,
+                    kind=kind,
+                )
+            index += 1
+    finally:
+        await mark_current_session_offline(client)
+
+
+async def sync_post_mirror_topic_title(
+    *,
+    state: Any,
+    topic_manager: Any | None,
+    source_chat_id: int,
+    title: str | None,
+    kind: str,
+) -> str:
+    normalized_title = (title or "").strip()
+    if not normalized_title:
+        return "skipped_no_title"
+    if kind not in {"channel", "group"}:
+        return "skipped_unsupported_chat"
+
+    settings = state.get_post_mirror_source_settings(int(source_chat_id))
+    if settings is None:
+        return "skipped_unconfigured"
+
+    current_title = (settings.title or "").strip()
+    if current_title == normalized_title:
+        return "skipped_current"
+
+    target_chat_id = state.get_post_mirror_target_chat_id()
+    if (
+        target_chat_id is None
+        or int(source_chat_id) == int(target_chat_id)
+        or settings.target_thread_id is None
+    ):
+        state.upsert_post_mirror_source(int(source_chat_id), normalized_title, kind)
+        return "updated_source_title"
+
+    if topic_manager is None:
+        return "skipped_no_topic_manager"
+
+    await topic_manager.rename_topic(target_chat_id, int(settings.target_thread_id), normalized_title)
+    state.upsert_post_mirror_source(int(source_chat_id), normalized_title, kind)
+    return "renamed"
 
 
 def _dialog_filter_title(folder: Any) -> str:
@@ -544,7 +712,10 @@ async def _entities_for_reaction_folder_peers(client: Any, peers: list[Any], *, 
         return []
     resolve_errors = _reaction_folder_peer_resolve_errors()
     try:
-        entities = await client.get_entity(peers)
+        try:
+            entities = await client.get_entity(peers)
+        finally:
+            await mark_current_session_offline(client)
     except resolve_errors:
         logger.warning(
             "reaction_folder_peer_batch_resolve_failed folder_id=%s peer_count=%s",
@@ -554,7 +725,10 @@ async def _entities_for_reaction_folder_peers(client: Any, peers: list[Any], *, 
         resolved = []
         for peer in peers:
             try:
-                resolved.append(await client.get_entity(peer))
+                try:
+                    resolved.append(await client.get_entity(peer))
+                finally:
+                    await mark_current_session_offline(client)
             except resolve_errors:
                 logger.warning(
                     "reaction_folder_peer_skipped folder_id=%s peer_type=%s",
@@ -573,7 +747,7 @@ async def _reaction_folder_members_from_peers(client: Any, peers: list[Any], *, 
     members_by_chat_id: dict[int, dict[str, Any]] = {}
     for entity in await _entities_for_reaction_folder_peers(client, peers, folder_id=folder_id):
         kind = _classify_peer_entity_kind(entity)
-        if kind != "channel":
+        if kind not in {"channel", "group"}:
             continue
         try:
             chat_id = int(utils.get_peer_id(entity))
@@ -597,7 +771,10 @@ async def sync_reaction_folders(client: Any, repository: Any) -> int:
     from telethon import errors
     from telethon.tl.functions.messages import GetDialogFiltersRequest
 
-    result = await client(GetDialogFiltersRequest())
+    try:
+        result = await client(GetDialogFiltersRequest())
+    finally:
+        await mark_current_session_offline(client)
     filters = getattr(result, "filters", result) or []
     folders: list[dict[str, Any]] = []
     for position, folder in enumerate(filters):
@@ -615,17 +792,20 @@ async def sync_reaction_folders(client: Any, repository: Any) -> int:
             )
         else:
             try:
-                async for dialog in client.iter_dialogs(folder=folder_id):
-                    kind = classify_dialog_kind(dialog)
-                    if kind != "channel":
-                        continue
-                    members.append(
-                        {
-                            "chat_id": int(dialog.id),
-                            "title": getattr(dialog, "title", None),
-                            "kind": kind,
-                        }
-                    )
+                try:
+                    async for dialog in client.iter_dialogs(folder=folder_id):
+                        kind = classify_dialog_kind(dialog)
+                        if kind not in {"channel", "group"}:
+                            continue
+                        members.append(
+                            {
+                                "chat_id": int(dialog.id),
+                                "title": getattr(dialog, "title", None),
+                                "kind": kind,
+                            }
+                        )
+                finally:
+                    await mark_current_session_offline(client)
             except errors.FolderIdInvalidError:
                 logger.warning(
                     "reaction_folder_invalid_folder_id folder_id=%s folder_type=%s",
@@ -672,6 +852,8 @@ async def record_account_premium_status(client: Any, repository: Any) -> bool:
     except Exception:
         logger.warning("account_premium_check_failed", exc_info=True)
         return False
+    finally:
+        await mark_current_session_offline(client)
     repository.set_account_premium(bool(getattr(me, "premium", False) or getattr(me, "is_premium", False)))
     return True
 
@@ -717,6 +899,1659 @@ async def dispatch_channel_message(event: Any, registry: FeatureRegistry, contex
     return str(result)
 
 
+async def dispatch_post_mirror(event: Any, registry: FeatureRegistry, context: AssistantContext) -> str | None:
+    if not is_mirrorable_source_message(event):
+        return None
+
+    mirror_event = build_post_mirror_event(event)
+    logger.info(
+        "post_mirror_received chat_id=%s message_id=%s grouped_id=%s message_count=%s",
+        mirror_event.chat_id,
+        mirror_event.message_id,
+        mirror_event.grouped_id,
+        len(mirror_event.message_ids),
+    )
+    try:
+        result = await registry.dispatch(mirror_event, context)
+    except telethon_errors.FloodWaitError:
+        logger.warning(
+            "post_mirror_dispatch_flood_wait chat_id=%s message_id=%s",
+            mirror_event.chat_id,
+            mirror_event.message_id,
+        )
+        raise
+    except Exception:
+        logger.exception(
+            "post_mirror_dispatch_failed chat_id=%s message_id=%s",
+            mirror_event.chat_id,
+            mirror_event.message_id,
+        )
+        return "error"
+    logger.info(
+        "post_mirror_dispatch_result chat_id=%s message_id=%s result=%s",
+        mirror_event.chat_id,
+        mirror_event.message_id,
+        result,
+    )
+    return str(result)
+
+
+class PostMirrorMediaDownloadError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class PostMirrorVideoMetadata:
+    width: int
+    height: int
+    duration: int
+
+
+class TelethonPostMirrorSender:
+    def __init__(
+        self,
+        client: Any,
+        *,
+        sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+        video_metadata_probe: Callable[[Path], Awaitable[tuple[int, int, int] | PostMirrorVideoMetadata | None]]
+        | None = None,
+        logger_: logging.Logger | None = None,
+    ):
+        self.client = client
+        self._sleep = sleep
+        self._video_metadata_probe = video_metadata_probe or self._probe_video_metadata
+        self._logger = logger_ or logger
+
+    async def copy_post(
+        self,
+        event: PostMirrorEvent,
+        *,
+        target_chat_id: int,
+        target_thread_id: int | None,
+    ) -> PostMirrorSendResult:
+        messages = event.messages
+        if not messages:
+            return PostMirrorSendResult()
+
+        media_count = 0
+        sent_count = 0
+        with tempfile.TemporaryDirectory(prefix="telepath-post-mirror-") as temp_dir:
+            temp_path = Path(temp_dir)
+            text_messages: list[tuple[str, Any]] = []
+            copy_messages: list[Any] = []
+            media_files: list[Path] = []
+            media_messages: list[Any] = []
+            captions: list[str] = []
+            caption_entities: list[list[Any]] = []
+
+            for message in messages:
+                if getattr(message, "media", None) is None:
+                    text = getattr(message, "message", None) or ""
+                    if text:
+                        text_messages.append((text, self._message_entities_for_send(getattr(message, "entities", None))))
+                    continue
+
+                if not self._has_downloadable_media(message):
+                    if self._is_webpage_media(message):
+                        text = getattr(message, "message", None) or ""
+                        if text:
+                            text_messages.append(
+                                (text, self._message_entities_for_send(getattr(message, "entities", None)))
+                            )
+                    else:
+                        copy_messages.append(message)
+                    continue
+
+                await _yield_post_mirror_history_to_realtime_if_pending()
+                downloaded = await self._download_media_to_path(message, temp_path)
+                if downloaded is None:
+                    raise PostMirrorMediaDownloadError(f"media download failed for message_id={int(message.id)}")
+                media_files.append(downloaded)
+                media_messages.append(message)
+                media_count += 1
+                captions.append(getattr(message, "message", None) or "")
+                caption_entities.append(self._message_entities_for_send(getattr(message, "entities", None)))
+
+            for text, text_entities in text_messages:
+                await self._call_with_flood_wait_retry(
+                    self.client.send_message,
+                    target_chat_id,
+                    text,
+                    reply_to=target_thread_id,
+                    formatting_entities=text_entities or None,
+                    parse_mode=None,
+                    link_preview=True,
+                )
+                sent_count += 1
+
+            for message in copy_messages:
+                await _yield_post_mirror_history_to_realtime_if_pending()
+                await self._call_with_flood_wait_retry(
+                    self.client.send_message,
+                    target_chat_id,
+                    message,
+                    reply_to=target_thread_id,
+                )
+                sent_count += 1
+
+            if media_files:
+                multiple = len(media_files) > 1
+                can_prepare_media = self._can_send_media_with_prepared_uploads()
+                formatting_entities = None
+                if any(caption_entities):
+                    formatting_entities = caption_entities if multiple else caption_entities[0]
+                send_file_kwargs: dict[str, Any] = {
+                    "caption": captions if multiple else (captions[0] or None),
+                    "reply_to": target_thread_id,
+                    "formatting_entities": formatting_entities,
+                    "parse_mode": None,
+                }
+                if not multiple and not can_prepare_media:
+                    send_file_kwargs.update(await self._media_send_options(media_messages[0], media_files[0]))
+                try:
+                    await _yield_post_mirror_history_to_realtime_if_pending()
+                    if multiple and can_prepare_media:
+                        await self._send_album_with_media_options(
+                            target_chat_id=target_chat_id,
+                            target_thread_id=target_thread_id,
+                            media_files=media_files,
+                            media_messages=media_messages,
+                            captions=captions,
+                            formatting_entities=(
+                                formatting_entities if isinstance(formatting_entities, list) else None
+                            ),
+                        )
+                    elif not multiple and can_prepare_media:
+                        await self._send_single_media_file(
+                            target_chat_id=target_chat_id,
+                            target_thread_id=target_thread_id,
+                            file=media_files[0],
+                            message=media_messages[0],
+                            caption=captions[0],
+                            formatting_entities=formatting_entities if isinstance(formatting_entities, list) else None,
+                        )
+                    else:
+                        await self._call_with_flood_wait_retry(
+                            self.client.send_file,
+                            target_chat_id,
+                            media_files if multiple else media_files[0],
+                            **send_file_kwargs,
+                        )
+                except telethon_errors.DocumentInvalidError:
+                    self._logger.warning("post_mirror_media_invalid_fallback_to_individual_files")
+                    await self._send_media_files_individually(
+                        target_chat_id=target_chat_id,
+                        target_thread_id=target_thread_id,
+                        media_files=media_files,
+                        media_messages=media_messages,
+                        captions=captions,
+                        formatting_entities=caption_entities,
+                        force_document_first=not multiple,
+                    )
+                sent_count += len(media_files)
+
+        return PostMirrorSendResult(message_count=sent_count, media_count=media_count)
+
+    @staticmethod
+    def _message_entities_for_send(entities: Any) -> list[Any]:
+        if not entities:
+            return []
+        from telethon import types
+
+        if not isinstance(entities, (list, tuple)):
+            return []
+        return [entity for entity in entities if isinstance(entity, types.TypeMessageEntity)]
+
+    @staticmethod
+    def _has_downloadable_media(message: Any) -> bool:
+        return (
+            getattr(message, "file", None) is not None
+            or TelethonPostMirrorSender._message_photo(message) is not None
+            or TelethonPostMirrorSender._message_document(message) is not None
+        )
+
+    @staticmethod
+    def _is_webpage_media(message: Any) -> bool:
+        media = TelethonPostMirrorSender._message_media(message)
+        if media is None:
+            return False
+        return media.__class__.__name__ == "MessageMediaWebPage" or getattr(media, "webpage", None) is not None
+
+    @staticmethod
+    def _message_media(message: Any) -> Any | None:
+        return getattr(message, "media", None)
+
+    @staticmethod
+    def _message_document(message: Any) -> Any | None:
+        direct = getattr(message, "document", None)
+        if direct is not None:
+            return direct
+        media = TelethonPostMirrorSender._message_media(message)
+        return getattr(media, "document", None) if media is not None else None
+
+    @staticmethod
+    def _message_photo(message: Any) -> Any | None:
+        direct = getattr(message, "photo", None)
+        if direct is not None:
+            return direct
+        media = TelethonPostMirrorSender._message_media(message)
+        return getattr(media, "photo", None) if media is not None else None
+
+    @staticmethod
+    def _single_media_send_options(message: Any) -> dict[str, Any]:
+        options: dict[str, Any] = {}
+        document = TelethonPostMirrorSender._message_document(message)
+        if document is not None:
+            mime_type = getattr(document, "mime_type", None)
+            attributes = getattr(document, "attributes", None)
+            if mime_type:
+                options["mime_type"] = mime_type
+            if attributes:
+                options["attributes"] = attributes
+
+        if getattr(message, "voice", False):
+            options["voice_note"] = True
+        if getattr(message, "video_note", False):
+            options["video_note"] = True
+        elif getattr(message, "video", False):
+            options["supports_streaming"] = True
+        return options
+
+    async def _media_send_options(self, message: Any, file: Path) -> dict[str, Any]:
+        options = self._single_media_send_options(message)
+        if not self._looks_like_video_message(message, options):
+            return options
+
+        from telethon import types
+
+        attributes = list(options.get("attributes") or [])
+        video_attr = self._video_attribute(attributes)
+        if self._has_valid_video_dimensions(video_attr):
+            return options
+
+        await _yield_post_mirror_history_to_realtime_if_pending()
+        metadata = await self._video_metadata_probe(file)
+        if metadata is None:
+            return options
+        if isinstance(metadata, tuple):
+            metadata = PostMirrorVideoMetadata(
+                width=int(metadata[0]),
+                height=int(metadata[1]),
+                duration=int(metadata[2]),
+            )
+        if metadata.width <= 1 or metadata.height <= 1:
+            return options
+
+        if video_attr is not None:
+            round_message = bool(getattr(video_attr, "round_message", False))
+            supports_streaming = bool(
+                getattr(video_attr, "supports_streaming", False) or options.get("supports_streaming")
+            )
+            duration = int(getattr(video_attr, "duration", 0) or metadata.duration or 0)
+        else:
+            round_message = bool(getattr(message, "video_note", False))
+            supports_streaming = bool(options.get("supports_streaming"))
+            duration = int(metadata.duration or 0)
+        repaired = types.DocumentAttributeVideo(
+            duration=duration,
+            w=int(metadata.width),
+            h=int(metadata.height),
+            round_message=round_message,
+            supports_streaming=supports_streaming,
+        )
+        attributes = [
+            repaired if isinstance(attribute, types.DocumentAttributeVideo) else attribute
+            for attribute in attributes
+        ]
+        if video_attr is None:
+            attributes.append(repaired)
+        options["attributes"] = tuple(attributes)
+        return options
+
+    @staticmethod
+    def _looks_like_video_message(message: Any, options: dict[str, Any]) -> bool:
+        if getattr(message, "video", False) or getattr(message, "video_note", False):
+            return True
+        mime_type = str(options.get("mime_type") or "")
+        return mime_type.startswith("video/")
+
+    @staticmethod
+    def _video_attribute(attributes: list[Any]) -> Any | None:
+        from telethon import types
+
+        for attribute in attributes:
+            if isinstance(attribute, types.DocumentAttributeVideo):
+                return attribute
+        return None
+
+    @staticmethod
+    def _has_valid_video_dimensions(attribute: Any | None) -> bool:
+        if attribute is None:
+            return False
+        return int(getattr(attribute, "w", 0) or 0) > 1 and int(getattr(attribute, "h", 0) or 0) > 1
+
+    def _can_send_media_with_prepared_uploads(self) -> bool:
+        return (
+            hasattr(self.client, "_file_to_media")
+            and hasattr(self.client, "_get_response_message")
+            and hasattr(self.client, "get_input_entity")
+        )
+
+    async def _send_media_files_individually(
+        self,
+        *,
+        target_chat_id: int,
+        target_thread_id: int,
+        media_files: list[Path],
+        media_messages: list[Any],
+        captions: list[str],
+        formatting_entities: list[list[Any]],
+        force_document_first: bool = False,
+    ) -> None:
+        for index, (file, message) in enumerate(zip(media_files, media_messages)):
+            file_entities = formatting_entities[index] if index < len(formatting_entities) else []
+            try:
+                await _yield_post_mirror_history_to_realtime_if_pending()
+                if self._can_send_media_with_prepared_uploads():
+                    await self._send_single_media_file(
+                        target_chat_id=target_chat_id,
+                        target_thread_id=target_thread_id,
+                        file=file,
+                        message=message,
+                        caption=captions[index],
+                        formatting_entities=file_entities,
+                        force_document=force_document_first,
+                    )
+                else:
+                    kwargs: dict[str, Any] = {
+                        "caption": captions[index] or None,
+                        "reply_to": target_thread_id,
+                        "parse_mode": None,
+                    }
+                    if file_entities:
+                        kwargs["formatting_entities"] = file_entities
+                    kwargs.update(await self._media_send_options(message, file))
+                    if force_document_first:
+                        kwargs["force_document"] = True
+                    await self._call_with_flood_wait_retry(self.client.send_file, target_chat_id, file, **kwargs)
+            except telethon_errors.DocumentInvalidError:
+                self._logger.warning("post_mirror_media_invalid_retrying_as_document")
+                await _yield_post_mirror_history_to_realtime_if_pending()
+                if self._can_send_media_with_prepared_uploads():
+                    await self._send_single_media_file(
+                        target_chat_id=target_chat_id,
+                        target_thread_id=target_thread_id,
+                        file=file,
+                        message=message,
+                        caption=captions[index],
+                        formatting_entities=file_entities,
+                        force_document=True,
+                    )
+                else:
+                    kwargs = {
+                        "caption": captions[index] or None,
+                        "reply_to": target_thread_id,
+                        "parse_mode": None,
+                        "force_document": True,
+                    }
+                    if file_entities:
+                        kwargs["formatting_entities"] = file_entities
+                    kwargs.update(await self._media_send_options(message, file))
+                    await self._call_with_flood_wait_retry(self.client.send_file, target_chat_id, file, **kwargs)
+
+    async def _send_single_media_file(
+        self,
+        *,
+        target_chat_id: int,
+        target_thread_id: int,
+        file: Path,
+        message: Any,
+        caption: str,
+        formatting_entities: list[Any] | None,
+        force_document: bool = False,
+    ) -> None:
+        from telethon import functions, types
+
+        await _yield_post_mirror_history_to_realtime_if_pending()
+        try:
+            entity = await _retry_post_mirror_history_preemptions(
+                lambda: self.client.get_input_entity(target_chat_id)
+            )
+        finally:
+            await mark_current_session_offline(self.client, logger_=self._logger)
+        options = await self._media_send_options(message, file)
+        file_to_media_kwargs: dict[str, Any] = {
+            "force_document": force_document,
+        }
+        for key in ("attributes", "mime_type", "voice_note", "video_note", "supports_streaming"):
+            if key in options:
+                file_to_media_kwargs[key] = options[key]
+        while True:
+            try:
+                await _yield_post_mirror_history_to_realtime_if_pending()
+                _, input_media, _ = await _await_post_mirror_history_interruptibly(
+                    lambda: self.client._file_to_media(file, **file_to_media_kwargs)
+                )
+                break
+            except PostMirrorHistoryPreempted:
+                continue
+        if input_media is None:
+            raise TypeError(f"Cannot use {file!r} as file")
+        request = functions.messages.SendMediaRequest(
+            entity,
+            input_media,
+            reply_to=types.InputReplyToMessage(int(target_thread_id)),
+            message=caption or "",
+            entities=formatting_entities or None,
+        )
+        result = await self._call_with_flood_wait_retry(self.client, request)
+        self.client._get_response_message(request, result, entity)
+
+    async def _send_album_with_media_options(
+        self,
+        *,
+        target_chat_id: int,
+        target_thread_id: int,
+        media_files: list[Path],
+        media_messages: list[Any],
+        captions: list[str],
+        formatting_entities: list[list[Any]] | None,
+    ) -> None:
+        from telethon import functions, types, utils
+
+        await _yield_post_mirror_history_to_realtime_if_pending()
+        try:
+            entity = await _retry_post_mirror_history_preemptions(
+                lambda: self.client.get_input_entity(target_chat_id)
+            )
+        finally:
+            await mark_current_session_offline(self.client, logger_=self._logger)
+        reply_to = types.InputReplyToMessage(int(target_thread_id))
+        for start in range(0, len(media_files), 10):
+            chunk_files = media_files[start : start + 10]
+            chunk_messages = media_messages[start : start + 10]
+            chunk_captions = captions[start : start + 10]
+            chunk_entities = formatting_entities[start : start + 10] if formatting_entities else None
+            media = []
+            for index, (file, message) in enumerate(zip(chunk_files, chunk_messages)):
+                await _yield_post_mirror_history_to_realtime_if_pending()
+                options = await self._media_send_options(message, file)
+                file_to_media_kwargs: dict[str, Any] = {
+                    "nosound_video": True,
+                }
+                for key in ("attributes", "mime_type", "voice_note", "video_note", "supports_streaming"):
+                    if key in options:
+                        file_to_media_kwargs[key] = options[key]
+                while True:
+                    try:
+                        await _yield_post_mirror_history_to_realtime_if_pending()
+                        _, input_media, _ = await _await_post_mirror_history_interruptibly(
+                            lambda: self.client._file_to_media(file, **file_to_media_kwargs)
+                        )
+                        break
+                    except PostMirrorHistoryPreempted:
+                        continue
+                if isinstance(input_media, (types.InputMediaUploadedPhoto, types.InputMediaPhotoExternal)):
+                    result = await self._call_with_flood_wait_retry(
+                        self.client,
+                        functions.messages.UploadMediaRequest(entity, media=input_media),
+                        interruptible=True,
+                    )
+                    input_media = utils.get_input_media(result.photo)
+                elif isinstance(input_media, (types.InputMediaUploadedDocument, types.InputMediaDocumentExternal)):
+                    result = await self._call_with_flood_wait_retry(
+                        self.client,
+                        functions.messages.UploadMediaRequest(entity, media=input_media),
+                        interruptible=True,
+                    )
+                    input_media = utils.get_input_media(
+                        result.document,
+                        supports_streaming=bool(file_to_media_kwargs.get("supports_streaming")),
+                    )
+                media.append(
+                    types.InputSingleMedia(
+                        input_media,
+                        message=chunk_captions[index] if index < len(chunk_captions) else "",
+                        entities=chunk_entities[index] if chunk_entities and index < len(chunk_entities) else None,
+                    )
+                )
+            request = functions.messages.SendMultiMediaRequest(
+                entity,
+                reply_to=reply_to,
+                multi_media=media,
+            )
+            await _yield_post_mirror_history_to_realtime_if_pending()
+            result = await self._call_with_flood_wait_retry(self.client, request)
+            self.client._get_response_message([item.random_id for item in media], result, entity)
+
+    async def _call_with_flood_wait_retry(
+        self,
+        func: Callable[..., Awaitable[Any]],
+        *args: Any,
+        interruptible: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        while True:
+            try:
+                await _yield_post_mirror_history_to_realtime_if_pending()
+                try:
+                    if interruptible:
+                        return await _await_post_mirror_history_interruptibly(lambda: func(*args, **kwargs))
+                    return await func(*args, **kwargs)
+                finally:
+                    await mark_current_session_offline(self.client, logger_=self._logger)
+            except PostMirrorHistoryPreempted:
+                if interruptible:
+                    continue
+                raise
+            except telethon_errors.FloodWaitError as exc:
+                wait_seconds = post_mirror_flood_wait_delay_seconds(exc)
+                self._logger.warning("post_mirror_sender_flood_wait wait_seconds=%s", wait_seconds)
+                sleep = _POST_MIRROR_FLOOD_WAIT_SLEEP.get() or self._sleep
+                await sleep(wait_seconds)
+
+    async def _probe_video_metadata(self, file: Path) -> PostMirrorVideoMetadata | None:
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            return None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height,duration:stream_tags=rotate:stream_side_data=rotation:format=duration",
+                "-of",
+                "json",
+                str(file),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+        except Exception:
+            self._logger.exception("post_mirror_video_probe_failed path=%s", file)
+            return None
+        if process.returncode != 0:
+            return None
+        try:
+            payload = json.loads(stdout.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            return None
+        streams = payload.get("streams") or []
+        if not streams:
+            return None
+        stream = streams[0]
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+        if width > 0 and height > 0 and self._video_rotation_requires_dimension_swap(stream):
+            width, height = height, width
+        duration_value = stream.get("duration") or (payload.get("format") or {}).get("duration") or 0
+        try:
+            duration = int(float(duration_value))
+        except (TypeError, ValueError):
+            duration = 0
+        if width <= 1 or height <= 1:
+            return None
+        return PostMirrorVideoMetadata(width=width, height=height, duration=duration)
+
+    @classmethod
+    def _video_rotation_requires_dimension_swap(cls, stream: dict[str, Any]) -> bool:
+        rotation = cls._video_rotation_degrees(stream)
+        if rotation is None:
+            return False
+        return abs(rotation) % 180 == 90
+
+    @classmethod
+    def _video_rotation_degrees(cls, stream: dict[str, Any]) -> int | None:
+        tags = stream.get("tags") or {}
+        rotation = cls._parse_video_rotation(tags.get("rotate"))
+        if rotation is not None:
+            return rotation
+        for item in stream.get("side_data_list") or []:
+            rotation = cls._parse_video_rotation(item.get("rotation"))
+            if rotation is not None:
+                return rotation
+        return None
+
+    @staticmethod
+    def _parse_video_rotation(value: Any) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(round(float(value)))
+        except (TypeError, ValueError):
+            return None
+
+    async def _download_media_to_path(self, message: Any, directory: Path) -> Path | None:
+        while True:
+            try:
+                await _yield_post_mirror_history_to_realtime_if_pending()
+                try:
+                    downloaded = await _await_post_mirror_history_interruptibly(
+                        lambda: self.client.download_media(message, file=directory)
+                    )
+                finally:
+                    await mark_current_session_offline(self.client, logger_=self._logger)
+                break
+            except PostMirrorHistoryPreempted:
+                continue
+        if downloaded is None:
+            return None
+        if isinstance(downloaded, bytes):
+            path = directory / f"{int(message.id)}.bin"
+            path.write_bytes(downloaded)
+            return path
+        path = Path(downloaded)
+        return path if path.exists() else None
+
+
+class PostMirrorOutboxEnqueuer:
+    def __init__(
+        self,
+        state: Any,
+        *,
+        origin: str = "realtime",
+        ready_at: Callable[[], int] | None = None,
+    ) -> None:
+        self._state = state
+        self._origin = origin if origin in {"realtime", "history"} else "realtime"
+        self._ready_at = ready_at or (lambda: 0)
+
+    async def copy_post(
+        self,
+        event: PostMirrorEvent,
+        *,
+        target_chat_id: int,
+        target_thread_id: int,
+    ) -> PostMirrorSendResult:
+        message_ids = event.message_ids or (event.message_id,)
+        self._state.enqueue_post_mirror_delivery(
+            source_chat_id=event.chat_id,
+            message_ids=message_ids,
+            is_channel=event.is_channel,
+            is_group=event.is_group,
+            grouped_id=event.grouped_id,
+            target_chat_id=target_chat_id,
+            target_thread_id=target_thread_id,
+            origin=self._origin,
+            ready_at=self._ready_at(),
+        )
+        media_count = sum(1 for message in event.messages if getattr(message, "media", None) is not None)
+        return PostMirrorSendResult(message_count=len(message_ids), media_count=media_count)
+
+
+class TelegramAuthorizationOnlineGate:
+    def __init__(
+        self,
+        client: Any,
+        *,
+        freshness_seconds: int = 180,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._client = client
+        self._freshness_seconds = max(1, int(freshness_seconds))
+        self._now = now or (lambda: datetime.now(timezone.utc))
+
+    async def is_online(self) -> bool:
+        from telethon import functions
+
+        try:
+            result = await self._client(functions.account.GetAuthorizationsRequest())
+        except Exception:
+            logger.exception("post_mirror_online_gate_check_failed")
+            return False
+        finally:
+            await mark_current_session_offline(self._client)
+        now = self._normalize_datetime(self._now())
+        for authorization in getattr(result, "authorizations", None) or []:
+            if getattr(authorization, "current", False):
+                continue
+            active_at = getattr(authorization, "date_active", None)
+            if active_at is None:
+                continue
+            active_at = self._normalize_datetime(active_at)
+            if (now - active_at).total_seconds() <= self._freshness_seconds:
+                return True
+        return False
+
+    @staticmethod
+    def _normalize_datetime(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+
+class OnlineGatedForumTopicManager:
+    def __init__(
+        self,
+        topic_manager: Any,
+        online_gate: Any,
+        *,
+        logger_: logging.Logger | None = None,
+    ) -> None:
+        self._topic_manager = topic_manager
+        self._online_gate = online_gate
+        self._logger = logger_ or logger
+
+    async def create_topic(self, target_chat_id: int, title: str) -> int:
+        if not await self._online_gate.is_online():
+            raise RuntimeError("owner is offline; topic creation is deferred")
+        return await self._topic_manager.create_topic(target_chat_id, title)
+
+    async def rename_topic(self, target_chat_id: int, topic_id: int, title: str) -> None:
+        if not await self._online_gate.is_online():
+            self._logger.info(
+                "post_mirror_topic_rename_deferred_until_owner_online target_chat_id=%s topic_id=%s",
+                target_chat_id,
+                topic_id,
+            )
+            return
+        await self._topic_manager.rename_topic(target_chat_id, topic_id, title)
+
+
+POST_MIRROR_OUTBOX_DELIVERY_POLL_SECONDS = 30.0
+POST_MIRROR_OUTBOX_DELIVERY_DELAY_RANGE_SECONDS = (60, 120)
+POST_MIRROR_OUTBOX_RETRY_DELAY_SECONDS = 300
+
+
+class PostMirrorOutboxDeliveryWorker:
+    def __init__(
+        self,
+        *,
+        state: Any,
+        client: Any,
+        post_mirror_sender: Any,
+        online_gate: Any,
+        post_mirror_topic_manager: Any | None = None,
+        poll_seconds: float = POST_MIRROR_OUTBOX_DELIVERY_POLL_SECONDS,
+        delivery_delay_range_seconds: tuple[int, int] = POST_MIRROR_OUTBOX_DELIVERY_DELAY_RANGE_SECONDS,
+        randint: Callable[[int, int], int] = random.randint,
+        sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+        now: Callable[[], int] | None = None,
+        logger_: logging.Logger | None = None,
+    ) -> None:
+        self._state = state
+        self._client = client
+        self._post_mirror_sender = post_mirror_sender
+        self._online_gate = online_gate
+        self._post_mirror_topic_manager = post_mirror_topic_manager
+        self._poll_seconds = max(0.1, float(poll_seconds))
+        self._delivery_delay_range_seconds = self._normalize_delay_range(delivery_delay_range_seconds)
+        self._randint = randint
+        self._sleep = sleep
+        self._now = now or (lambda: int(time.time()))
+        self._logger = logger_ or logger
+
+    async def run(self) -> None:
+        while True:
+            await self.drain_once()
+            await self._sleep(self._poll_seconds)
+
+    async def drain_once(self, *, limit: int = 10) -> int:
+        if not await self._online_gate.is_online():
+            self._logger.info("post_mirror_outbox_waiting_for_owner_online")
+            return 0
+        jobs = self._state.list_ready_post_mirror_deliveries(now=self._now(), limit=limit)
+        sent_count = 0
+        for job in jobs:
+            if sent_count > 0:
+                await self._sleep_between_deliveries()
+            delivered = await self._deliver_job(job)
+            if delivered:
+                sent_count += 1
+        return sent_count
+
+    async def _deliver_job(self, job: PostMirrorQueuedDelivery) -> bool:
+        try:
+            if not self._delivery_still_allowed(job):
+                self._state.cancel_post_mirror_delivery(job.id, error="post mirror target or source disabled")
+                return False
+            messages = await self._load_messages(job)
+            if not messages:
+                self._state.defer_post_mirror_delivery(
+                    job.id,
+                    delay_seconds=POST_MIRROR_OUTBOX_RETRY_DELAY_SECONDS,
+                    error="source messages unavailable",
+                    now=self._now(),
+                )
+                return False
+            target_thread_id = await self._resolve_target_thread_id(job)
+            if target_thread_id is None:
+                self._state.defer_post_mirror_delivery(
+                    job.id,
+                    delay_seconds=POST_MIRROR_OUTBOX_RETRY_DELAY_SECONDS,
+                    error="target topic unavailable",
+                    now=self._now(),
+                )
+                return False
+            event = PostMirrorEvent(
+                chat_id=job.source_chat_id,
+                message_id=job.message_ids[0],
+                message_ids=job.message_ids,
+                is_channel=job.is_channel,
+                is_group=job.is_group,
+                grouped_id=job.grouped_id,
+                messages=tuple(messages),
+            )
+            result = await self._post_mirror_sender.copy_post(
+                event,
+                target_chat_id=job.target_chat_id,
+                target_thread_id=target_thread_id,
+            )
+            if result.message_count <= 0 and result.media_count <= 0:
+                self._state.defer_post_mirror_delivery(
+                    job.id,
+                    delay_seconds=POST_MIRROR_OUTBOX_RETRY_DELAY_SECONDS,
+                    error="empty send result",
+                    now=self._now(),
+                )
+                return False
+            self._state.mark_post_mirror_delivery_sent(job.id, now=self._now())
+            self._logger.info(
+                "post_mirror_outbox_delivered job_id=%s source_chat_id=%s message_ids=%s target_chat_id=%s",
+                job.id,
+                job.source_chat_id,
+                ",".join(str(message_id) for message_id in job.message_ids),
+                job.target_chat_id,
+            )
+            return True
+        except telethon_errors.FloodWaitError as exc:
+            wait_seconds = post_mirror_flood_wait_delay_seconds(exc)
+            self._state.defer_post_mirror_delivery(
+                job.id,
+                delay_seconds=wait_seconds,
+                error=f"flood wait {wait_seconds}s",
+                now=self._now(),
+            )
+            self._logger.warning("post_mirror_outbox_flood_wait job_id=%s wait_seconds=%s", job.id, wait_seconds)
+            return False
+        except Exception as exc:
+            self._state.defer_post_mirror_delivery(
+                job.id,
+                delay_seconds=POST_MIRROR_OUTBOX_RETRY_DELAY_SECONDS,
+                error=str(exc)[:500],
+                now=self._now(),
+            )
+            self._logger.exception("post_mirror_outbox_delivery_failed job_id=%s", job.id)
+            return False
+
+    def _delivery_still_allowed(self, job: PostMirrorQueuedDelivery) -> bool:
+        if not self._state.is_post_mirroring_enabled():
+            return False
+        target_chat_id = self._state.get_post_mirror_target_chat_id()
+        if target_chat_id is None or int(target_chat_id) != int(job.target_chat_id):
+            return False
+        settings = self._state.get_post_mirror_source_settings(job.source_chat_id)
+        return settings is not None and bool(settings.enabled)
+
+    async def _load_messages(self, job: PostMirrorQueuedDelivery) -> list[Any]:
+        try:
+            result = await self._client.get_messages(job.source_chat_id, ids=list(job.message_ids))
+        finally:
+            await mark_current_session_offline(self._client, logger_=self._logger)
+        if result is None:
+            return []
+        if isinstance(result, (list, tuple)):
+            messages = [message for message in result if message is not None]
+        else:
+            messages = [result]
+        by_id = {int(getattr(message, "id")): message for message in messages}
+        return [by_id[message_id] for message_id in job.message_ids if message_id in by_id]
+
+    async def _resolve_target_thread_id(self, job: PostMirrorQueuedDelivery) -> int | None:
+        if job.target_thread_id is not None:
+            return int(job.target_thread_id)
+        if self._post_mirror_topic_manager is None:
+            return None
+        settings = self._state.get_post_mirror_source_settings(job.source_chat_id)
+        title = (getattr(settings, "title", None) or "").strip() or str(job.source_chat_id)
+        if settings is not None and getattr(settings, "kind", None) in {"channel", "group"}:
+            kind = settings.kind
+        else:
+            kind = "group" if job.is_group else "channel"
+        topic_id = await self._post_mirror_topic_manager.create_topic(job.target_chat_id, title)
+        self._state.upsert_post_mirror_source(job.source_chat_id, title, kind)
+        self._state.set_post_mirror_source_topic(job.source_chat_id, int(topic_id))
+        return int(topic_id)
+
+    async def _sleep_between_deliveries(self) -> None:
+        minimum, maximum = self._delivery_delay_range_seconds
+        if maximum <= 0:
+            return
+        await self._sleep(self._randint(minimum, maximum))
+
+    @staticmethod
+    def _normalize_delay_range(delay_range: tuple[int, int]) -> tuple[int, int]:
+        minimum, maximum = delay_range
+        minimum = int(minimum)
+        maximum = int(maximum)
+        if minimum < 0 or maximum < minimum:
+            raise ValueError("delivery_delay_range_seconds must be non-negative and ordered")
+        return minimum, maximum
+
+
+class TelethonForumTopicManager:
+    def __init__(
+        self,
+        client: Any,
+        *,
+        random_id_factory: Callable[[], int] | None = None,
+    ) -> None:
+        self.client = client
+        self.random_id_factory = random_id_factory or (lambda: random.getrandbits(63))
+
+    async def create_topic(self, target_chat_id: int, title: str) -> int:
+        from telethon.tl.functions.messages import CreateForumTopicRequest
+        from telethon.tl.types import MessageActionTopicCreate
+
+        await _yield_post_mirror_history_to_realtime_if_pending()
+        try:
+            peer = await _retry_post_mirror_history_preemptions(lambda: self.client.get_input_entity(target_chat_id))
+        finally:
+            await mark_current_session_offline(self.client)
+        await _yield_post_mirror_history_to_realtime_if_pending()
+        try:
+            result = await self.client(
+                CreateForumTopicRequest(
+                    peer=peer,
+                    title=title.strip() or str(target_chat_id),
+                    icon_color=0x6FB9F0,
+                    random_id=self.random_id_factory(),
+                )
+            )
+        finally:
+            await mark_current_session_offline(self.client)
+        for message in self._result_messages(result):
+            if isinstance(getattr(message, "action", None), MessageActionTopicCreate):
+                return int(message.id)
+        raise RuntimeError("Telegram did not return the created forum topic id.")
+
+    async def rename_topic(self, target_chat_id: int, topic_id: int, title: str) -> None:
+        from telethon.tl.functions.messages import EditForumTopicRequest
+
+        await _yield_post_mirror_history_to_realtime_if_pending()
+        try:
+            peer = await _retry_post_mirror_history_preemptions(lambda: self.client.get_input_entity(target_chat_id))
+        finally:
+            await mark_current_session_offline(self.client)
+        await _yield_post_mirror_history_to_realtime_if_pending()
+        try:
+            await self.client(
+                EditForumTopicRequest(
+                    peer=peer,
+                    topic_id=int(topic_id),
+                    title=title.strip() or str(topic_id),
+                )
+            )
+        finally:
+            await mark_current_session_offline(self.client)
+
+    @staticmethod
+    def _result_messages(result: Any) -> list[Any]:
+        messages = list(getattr(result, "messages", None) or [])
+        for update in getattr(result, "updates", None) or []:
+            message = getattr(update, "message", None)
+            if message is not None:
+                messages.append(message)
+        message = getattr(result, "message", None)
+        if message is not None:
+            messages.append(message)
+        return messages
+
+
+@dataclass(frozen=True)
+class PostMirrorHistoryBackfillResult:
+    source_count: int
+    scanned_count: int
+    mirrored_count: int
+    skipped_count: int
+    failed_count: int
+    limit_per_source: int | None
+    target_chat_id: int | None = None
+    request_queued: bool = False
+    duplicate_queued: bool = False
+    queue_position: int | None = None
+
+
+POST_MIRROR_HISTORY_FETCH_WAIT_SECONDS = 1.0
+POST_MIRROR_HISTORY_POST_DELAY_RANGE_SECONDS = (60, 120)
+POST_MIRROR_HISTORY_TOPIC_CREATE_DELAY_RANGE_SECONDS = (180, 360)
+
+
+class PostMirrorOperationGate:
+    def __init__(self) -> None:
+        self._active: str | None = None
+        self._realtime_backlog = 0
+        self._changed = asyncio.Event()
+        self._interruptible_history_tasks: set[asyncio.Task[Any]] = set()
+        self._preempted_history_tasks: set[asyncio.Task[Any]] = set()
+        self._changed.set()
+
+    def notify_realtime_queued(self) -> None:
+        self._realtime_backlog += 1
+        for task in tuple(self._interruptible_history_tasks):
+            if not task.done():
+                self._preempted_history_tasks.add(task)
+                task.cancel()
+        self._changed.set()
+
+    async def acquire_history(self) -> None:
+        while self._active is not None or self._realtime_backlog > 0:
+            self._changed.clear()
+            if self._active is None and self._realtime_backlog <= 0:
+                break
+            await self._changed.wait()
+        self._active = "history"
+
+    def release_history(self) -> None:
+        if self._active == "history":
+            self._active = None
+            self._changed.set()
+
+    async def yield_to_realtime_if_pending(self) -> None:
+        if self._realtime_backlog <= 0:
+            return
+        should_reacquire_history = self._active == "history"
+        if should_reacquire_history:
+            self.release_history()
+        try:
+            while self._active is not None or self._realtime_backlog > 0:
+                self._changed.clear()
+                if self._active is None and self._realtime_backlog <= 0:
+                    break
+                await self._changed.wait()
+        finally:
+            if should_reacquire_history:
+                await self.acquire_history()
+
+    async def acquire_realtime(self) -> None:
+        if self._realtime_backlog <= 0:
+            self._realtime_backlog = 1
+        while self._active is not None:
+            self._changed.clear()
+            if self._active is None:
+                break
+            await self._changed.wait()
+        self._active = "realtime"
+
+    def release_realtime(self) -> None:
+        if self._active == "realtime":
+            self._active = None
+        if self._realtime_backlog > 0:
+            self._realtime_backlog -= 1
+        self._changed.set()
+
+    @asynccontextmanager
+    async def history_operation(self) -> Any:
+        await self.acquire_history()
+        try:
+            yield
+        finally:
+            self.release_history()
+
+    @asynccontextmanager
+    async def realtime_operation(self) -> Any:
+        await self.acquire_realtime()
+        try:
+            yield
+        finally:
+            self.release_realtime()
+
+    async def interruptible_history_await(self, factory: Callable[[], Awaitable[Any]]) -> Any:
+        task = asyncio.create_task(factory())
+        self._interruptible_history_tasks.add(task)
+        try:
+            return await task
+        except asyncio.CancelledError:
+            if task in self._preempted_history_tasks:
+                await self.yield_to_realtime_if_pending()
+                raise PostMirrorHistoryPreempted from None
+            raise
+        finally:
+            self._interruptible_history_tasks.discard(task)
+            self._preempted_history_tasks.discard(task)
+
+    async def sleep_during_history_pause(
+        self,
+        delay: float,
+        sleep: Callable[[float], Awaitable[Any]],
+    ) -> None:
+        await self.yield_to_realtime_if_pending()
+        if self._active != "history":
+            await sleep(delay)
+            return
+        self.release_history()
+        try:
+            await sleep(delay)
+        finally:
+            await self.acquire_history()
+
+
+class PostMirrorHistoryBackfill:
+    def __init__(
+        self,
+        *,
+        client: Any | None = None,
+        state: Any | None = None,
+        post_mirror_sender: Any | None = None,
+        post_mirror_topic_manager: Any | None = None,
+        operation_gate: PostMirrorOperationGate | None = None,
+        history_fetch_wait_seconds: float = POST_MIRROR_HISTORY_FETCH_WAIT_SECONDS,
+        history_post_delay_range_seconds: tuple[int, int] = POST_MIRROR_HISTORY_POST_DELAY_RANGE_SECONDS,
+        history_topic_create_delay_range_seconds: tuple[int, int] = POST_MIRROR_HISTORY_TOPIC_CREATE_DELAY_RANGE_SECONDS,
+        randint: Callable[[int, int], int] = random.randint,
+        sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+        logger_: logging.Logger | None = None,
+    ) -> None:
+        self._client = client
+        self._state = state
+        self._post_mirror_sender = post_mirror_sender
+        self._post_mirror_topic_manager = post_mirror_topic_manager
+        self._operation_gate = operation_gate
+        self._history_fetch_wait_seconds = float(history_fetch_wait_seconds)
+        self._history_post_delay_range_seconds = self._normalize_delay_range(history_post_delay_range_seconds)
+        self._history_topic_create_delay_range_seconds = self._normalize_delay_range(
+            history_topic_create_delay_range_seconds
+        )
+        self._randint = randint
+        self._sleep = sleep
+        self._logger = logger_ or logger
+        self._lock = asyncio.Lock()
+        self._queue_lock = asyncio.Lock()
+        self._queue: deque[tuple[int | None, int | None, int | None]] = deque()
+        self._active_request: tuple[int | None, int | None, int | None] | None = None
+        self._queue_task: asyncio.Task[None] | None = None
+
+    def bind(
+        self,
+        *,
+        client: Any,
+        state: Any,
+        post_mirror_sender: Any,
+        post_mirror_topic_manager: Any | None = None,
+        operation_gate: PostMirrorOperationGate | None = None,
+    ) -> None:
+        self._client = client
+        self._state = state
+        self._post_mirror_sender = post_mirror_sender
+        self._post_mirror_topic_manager = post_mirror_topic_manager
+        if operation_gate is not None:
+            self._operation_gate = operation_gate
+
+    async def process_history(
+        self,
+        *,
+        limit_per_source: int | None,
+        chat_id: int | None = None,
+        folder_id: int | None = None,
+    ) -> PostMirrorHistoryBackfillResult:
+        if self._client is None or self._state is None or self._post_mirror_sender is None:
+            raise RuntimeError("Telegram user client недоступен.")
+        if limit_per_source is not None and limit_per_source <= 0:
+            raise ValueError("limit_per_source must be positive or None")
+        if chat_id is not None and folder_id is not None:
+            raise ValueError("chat_id and folder_id are mutually exclusive")
+
+        async with self._lock:
+            return await self._process_history_locked(
+                limit_per_source=limit_per_source,
+                chat_id=chat_id,
+                folder_id=folder_id,
+            )
+
+    async def enqueue_history(
+        self,
+        *,
+        limit_per_source: int | None,
+        chat_id: int | None = None,
+        folder_id: int | None = None,
+    ) -> PostMirrorHistoryBackfillResult:
+        if self._client is None or self._state is None or self._post_mirror_sender is None:
+            raise RuntimeError("Telegram user client недоступен.")
+        if limit_per_source is not None and limit_per_source <= 0:
+            raise ValueError("limit_per_source must be positive or None")
+        if chat_id is not None and folder_id is not None:
+            raise ValueError("chat_id and folder_id are mutually exclusive")
+        request = (
+            limit_per_source,
+            int(chat_id) if chat_id is not None else None,
+            int(folder_id) if folder_id is not None else None,
+        )
+        async with self._queue_lock:
+            duplicate_position = self._request_queue_position_locked(request)
+            if duplicate_position is not None:
+                return PostMirrorHistoryBackfillResult(
+                    source_count=len(self._target_source_ids(chat_id, folder_id)),
+                    scanned_count=0,
+                    mirrored_count=0,
+                    skipped_count=0,
+                    failed_count=0,
+                    limit_per_source=limit_per_source,
+                    target_chat_id=self._state.get_post_mirror_target_chat_id(),
+                    request_queued=True,
+                    duplicate_queued=True,
+                    queue_position=duplicate_position,
+                )
+            self._queue.append(request)
+            queue_position = len(self._queue) + (1 if self._active_request is not None else 0)
+            if self._queue_task is None or self._queue_task.done():
+                self._queue_task = asyncio.create_task(
+                    self._run_history_queue(),
+                    name="post-mirror-history-queue",
+                )
+        return PostMirrorHistoryBackfillResult(
+            source_count=len(self._target_source_ids(chat_id, folder_id)),
+            scanned_count=0,
+            mirrored_count=0,
+            skipped_count=0,
+            failed_count=0,
+            limit_per_source=limit_per_source,
+            target_chat_id=self._state.get_post_mirror_target_chat_id(),
+            request_queued=True,
+            queue_position=queue_position,
+        )
+
+    def _request_queue_position_locked(self, request: tuple[int | None, int | None, int | None]) -> int | None:
+        if self._active_request == request:
+            return 1
+        offset = 1 if self._active_request is not None else 0
+        for index, queued_request in enumerate(self._queue, start=offset + 1):
+            if queued_request == request:
+                return index
+        return None
+
+    async def wait_history_queue_idle(self) -> None:
+        task = self._queue_task
+        if task is not None:
+            await task
+
+    async def _run_history_queue(self) -> None:
+        while True:
+            async with self._queue_lock:
+                if not self._queue:
+                    self._active_request = None
+                    self._queue_task = None
+                    return
+                request = self._queue.popleft()
+                self._active_request = request
+            try:
+                limit_per_source, chat_id, folder_id = request
+                await self.process_history(
+                    limit_per_source=limit_per_source,
+                    chat_id=chat_id,
+                    folder_id=folder_id,
+                )
+            except Exception:
+                self._logger.exception("post_mirror_history_job_failed")
+            finally:
+                async with self._queue_lock:
+                    if self._active_request == request:
+                        self._active_request = None
+
+    async def _process_history_locked(
+        self,
+        *,
+        limit_per_source: int | None,
+        chat_id: int | None,
+        folder_id: int | None,
+    ) -> PostMirrorHistoryBackfillResult:
+        target_chat_id = self._state.get_post_mirror_target_chat_id()
+        source_ids = self._target_source_ids(chat_id, folder_id)
+        if not self._state.is_post_mirroring_enabled() or target_chat_id is None or not source_ids:
+            return PostMirrorHistoryBackfillResult(
+                source_count=len(source_ids),
+                scanned_count=0,
+                mirrored_count=0,
+                skipped_count=0,
+                failed_count=0,
+                limit_per_source=limit_per_source,
+                target_chat_id=target_chat_id,
+            )
+
+        feature = PostMirrorFeature()
+        context = SimpleNamespace(
+            post_mirror_settings=self._state,
+            post_mirror_sender=self._post_mirror_sender,
+            post_mirror_topic_manager=self._post_mirror_topic_manager,
+            post_mirror_topic_create_cooldown=self._sleep_after_history_topic_create,
+            processed=self._state,
+        )
+        scanned_count = 0
+        mirrored_count = 0
+        skipped_count = 0
+        failed_count = 0
+        delay_next_history_post = False
+        self._logger.info(
+            "post_mirror_history_started source_count=%s limit_per_source=%s chat_id=%s folder_id=%s target_chat_id=%s",
+            len(source_ids),
+            limit_per_source,
+            chat_id,
+            folder_id,
+            target_chat_id,
+        )
+
+        async def process_batch(source_chat_id: int, settings: Any, batch: tuple[Any, ...]) -> None:
+            nonlocal mirrored_count, skipped_count, delay_next_history_post
+            if delay_next_history_post:
+                await self._sleep_between_history_posts()
+                delay_next_history_post = False
+            result = await self._handle_history_batch(
+                feature=feature,
+                context=context,
+                source_chat_id=source_chat_id,
+                settings=settings,
+                batch=batch,
+            )
+            self._logger.info(
+                "post_mirror_history_batch_result chat_id=%s message_id=%s message_count=%s grouped_id=%s result=%s",
+                source_chat_id,
+                int(batch[0].id),
+                len(batch),
+                (
+                    int(getattr(batch[0], "grouped_id"))
+                    if getattr(batch[0], "grouped_id", None) is not None
+                    else None
+                ),
+                result,
+            )
+            if result == "mirrored":
+                mirrored_count += 1
+                delay_next_history_post = True
+            else:
+                skipped_count += 1
+
+        for source_chat_id in source_ids:
+            settings = self._state.get_post_mirror_source_settings(source_chat_id)
+            if settings is None or not settings.enabled:
+                skipped_count += 1
+                self._logger.info(
+                    "post_mirror_history_source_skipped chat_id=%s reason=%s",
+                    source_chat_id,
+                    "missing_settings" if settings is None else "disabled",
+                )
+                continue
+            source_scanned_before = scanned_count
+            source_mirrored_before = mirrored_count
+            source_skipped_before = skipped_count
+            self._logger.info(
+                "post_mirror_history_source_started chat_id=%s has_topic=%s target_thread_id=%s limit_per_source=%s",
+                source_chat_id,
+                settings.target_thread_id is not None,
+                settings.target_thread_id,
+                limit_per_source,
+            )
+            try:
+                if limit_per_source is None:
+                    pending_album_key: int | None = None
+                    pending_album: list[Any] = []
+                    async for message in self._iter_history_messages(
+                        source_chat_id,
+                        reverse=True,
+                    ):
+                        scanned_count += 1
+                        if getattr(message, "action", None) is not None:
+                            if pending_album:
+                                await process_batch(source_chat_id, settings, tuple(pending_album))
+                                pending_album = []
+                                pending_album_key = None
+                            continue
+
+                        grouped_id = getattr(message, "grouped_id", None)
+                        if grouped_id is None:
+                            if pending_album:
+                                await process_batch(source_chat_id, settings, tuple(pending_album))
+                                pending_album = []
+                                pending_album_key = None
+                            await process_batch(source_chat_id, settings, (message,))
+                            continue
+
+                        album_key = int(grouped_id)
+                        if pending_album and pending_album_key != album_key:
+                            await process_batch(source_chat_id, settings, tuple(pending_album))
+                            pending_album = []
+                        pending_album_key = album_key
+                        pending_album.append(message)
+                    if pending_album:
+                        await process_batch(source_chat_id, settings, tuple(pending_album))
+                else:
+                    batches, scanned = await self._latest_post_batches(source_chat_id, limit_per_source)
+                    scanned_count += scanned
+                    for batch in batches:
+                        await process_batch(source_chat_id, settings, batch)
+                final_settings = self._state.get_post_mirror_source_settings(source_chat_id)
+                self._logger.info(
+                    "post_mirror_history_source_finished chat_id=%s scanned_count=%s mirrored_count=%s skipped_count=%s "
+                    "target_thread_id=%s",
+                    source_chat_id,
+                    scanned_count - source_scanned_before,
+                    mirrored_count - source_mirrored_before,
+                    skipped_count - source_skipped_before,
+                    getattr(final_settings, "target_thread_id", None),
+                )
+            except Exception:
+                failed_count += 1
+                self._logger.exception(
+                    "post_mirror_history_source_failed chat_id=%s scanned_count=%s mirrored_count=%s skipped_count=%s",
+                    source_chat_id,
+                    scanned_count - source_scanned_before,
+                    mirrored_count - source_mirrored_before,
+                    skipped_count - source_skipped_before,
+                )
+
+        self._logger.info(
+            "post_mirror_history_finished source_count=%s scanned_count=%s mirrored_count=%s skipped_count=%s "
+            "failed_count=%s limit_per_source=%s target_chat_id=%s",
+            len(source_ids),
+            scanned_count,
+            mirrored_count,
+            skipped_count,
+            failed_count,
+            limit_per_source,
+            target_chat_id,
+        )
+        return PostMirrorHistoryBackfillResult(
+            source_count=len(source_ids),
+            scanned_count=scanned_count,
+            mirrored_count=mirrored_count,
+            skipped_count=skipped_count,
+            failed_count=failed_count,
+            limit_per_source=limit_per_source,
+            target_chat_id=target_chat_id,
+        )
+
+    def _target_source_ids(self, chat_id: int | None, folder_id: int | None = None) -> list[int]:
+        target_chat_id = self._state.get_post_mirror_target_chat_id()
+        if chat_id is not None:
+            source_chat_id = int(chat_id)
+            if target_chat_id is not None and source_chat_id == int(target_chat_id):
+                return []
+            return [source_chat_id] if self._state.get_post_mirror_source_settings(source_chat_id) is not None else []
+        if folder_id is not None:
+            folder_sources = getattr(self._state, "list_post_mirror_folder_sources", None)
+            if not callable(folder_sources):
+                return []
+            source_ids = []
+            for source in folder_sources(int(folder_id)):
+                source_chat_id = int(source["chat_id"])
+                if target_chat_id is not None and source_chat_id == int(target_chat_id):
+                    continue
+                settings = self._state.get_post_mirror_source_settings(source_chat_id)
+                if settings is not None and settings.enabled:
+                    source_ids.append(source_chat_id)
+            return sorted(set(source_ids))
+        source_ids = [
+            int(source["source_chat_id"])
+            for source in self._state.list_post_mirror_sources()
+            if source["enabled"] and (target_chat_id is None or int(source["source_chat_id"]) != int(target_chat_id))
+        ]
+        folder_sources = getattr(self._state, "list_enabled_post_mirror_folder_sources", None)
+        if callable(folder_sources):
+            for source in folder_sources():
+                source_chat_id = int(source["chat_id"])
+                if target_chat_id is not None and source_chat_id == int(target_chat_id):
+                    continue
+                source_ids.append(source_chat_id)
+        return sorted(set(source_ids))
+
+    @staticmethod
+    def _normalize_delay_range(delay_range: tuple[int, int]) -> tuple[int, int]:
+        minimum, maximum = delay_range
+        minimum = int(minimum)
+        maximum = int(maximum)
+        if minimum < 0 or maximum < minimum:
+            raise ValueError("history_post_delay_range_seconds must be non-negative and ordered")
+        return minimum, maximum
+
+    async def _sleep_between_history_posts(self) -> None:
+        minimum, maximum = self._history_post_delay_range_seconds
+        if maximum <= 0:
+            return
+        await self._sleep_during_history_pause(self._randint(minimum, maximum))
+
+    async def _sleep_after_history_topic_create(self, chat_id: int) -> None:
+        minimum, maximum = self._history_topic_create_delay_range_seconds
+        if maximum <= 0:
+            return
+        delay = self._randint(minimum, maximum)
+        self._logger.info("post_mirror_history_topic_create_cooldown chat_id=%s delay_seconds=%s", chat_id, delay)
+        await self._sleep_during_history_pause(delay)
+
+    async def _sleep_during_history_pause(self, delay: float) -> None:
+        if self._operation_gate is None:
+            await self._sleep(delay)
+            return
+        await self._operation_gate.sleep_during_history_pause(delay, self._sleep)
+
+    async def _yield_to_realtime_if_pending(self) -> None:
+        if self._operation_gate is not None:
+            await self._operation_gate.yield_to_realtime_if_pending()
+
+    async def _interruptible_history_await(self, factory: Callable[[], Awaitable[Any]]) -> Any:
+        if self._operation_gate is None:
+            return await factory()
+        return await self._operation_gate.interruptible_history_await(factory)
+
+    @asynccontextmanager
+    async def _history_operation(self) -> Any:
+        if self._operation_gate is None:
+            yield
+            return
+        async with self._operation_gate.history_operation():
+            yield
+
+    async def _iter_history_messages(self, chat_id: int, *, reverse: bool) -> Any:
+        last_yielded_id: int | None = None
+
+        def make_iterator() -> Any:
+            kwargs: dict[str, Any] = {
+                "limit": None,
+                "reverse": reverse,
+                "wait_time": self._history_fetch_wait_seconds,
+            }
+            if last_yielded_id is not None:
+                if reverse:
+                    kwargs["min_id"] = last_yielded_id
+                else:
+                    kwargs["offset_id"] = last_yielded_id
+            return self._client.iter_messages(chat_id, **kwargs).__aiter__()
+
+        iterator = make_iterator()
+        try:
+            while True:
+                await self._yield_to_realtime_if_pending()
+                try:
+                    message = await self._interruptible_history_await(iterator.__anext__)
+                except telethon_errors.FloodWaitError as exc:
+                    wait_seconds = post_mirror_flood_wait_delay_seconds(exc)
+                    self._logger.warning(
+                        "post_mirror_history_fetch_flood_wait chat_id=%s wait_seconds=%s",
+                        chat_id,
+                        wait_seconds,
+                    )
+                    await self._sleep_during_history_pause(wait_seconds)
+                    continue
+                except PostMirrorHistoryPreempted:
+                    aclose = getattr(iterator, "aclose", None)
+                    if callable(aclose):
+                        await aclose()
+                    iterator = make_iterator()
+                    continue
+                except StopAsyncIteration:
+                    return
+                await self._yield_to_realtime_if_pending()
+                last_yielded_id = int(getattr(message, "id"))
+                yield message
+        finally:
+            aclose = getattr(iterator, "aclose", None)
+            if callable(aclose):
+                await aclose()
+            await mark_current_session_offline(self._client, logger_=self._logger)
+
+    async def _handle_history_batch(
+        self,
+        *,
+        feature: PostMirrorFeature,
+        context: Any,
+        source_chat_id: int,
+        settings: Any,
+        batch: tuple[Any, ...],
+    ) -> str:
+        event = PostMirrorEvent(
+            chat_id=source_chat_id,
+            message_id=int(batch[0].id),
+            message_ids=tuple(int(message.id) for message in batch),
+            is_channel=settings.kind == "channel",
+            is_group=settings.kind == "group",
+            grouped_id=(
+                int(getattr(batch[0], "grouped_id"))
+                if getattr(batch[0], "grouped_id", None) is not None
+                else None
+            ),
+            messages=tuple(batch),
+        )
+        token = _POST_MIRROR_FLOOD_WAIT_SLEEP.set(self._sleep_during_history_pause)
+        yield_token = _POST_MIRROR_REALTIME_YIELD.set(self._yield_to_realtime_if_pending)
+        interruptible_token = _POST_MIRROR_INTERRUPTIBLE_HISTORY_AWAIT.set(self._interruptible_history_await)
+        try:
+            async with self._history_operation():
+                while True:
+                    try:
+                        return await feature.handle(event, context)
+                    except telethon_errors.FloodWaitError as exc:
+                        wait_seconds = post_mirror_flood_wait_delay_seconds(exc)
+                        self._logger.warning(
+                            "post_mirror_history_flood_wait chat_id=%s wait_seconds=%s",
+                            source_chat_id,
+                            wait_seconds,
+                        )
+                        await self._sleep_during_history_pause(wait_seconds)
+        finally:
+            _POST_MIRROR_INTERRUPTIBLE_HISTORY_AWAIT.reset(interruptible_token)
+            _POST_MIRROR_REALTIME_YIELD.reset(yield_token)
+            _POST_MIRROR_FLOOD_WAIT_SLEEP.reset(token)
+
+    async def _latest_post_batches(self, chat_id: int, limit: int | None) -> tuple[list[tuple[Any, ...]], int]:
+        batches_by_key: OrderedDict[object, list[Any]] = OrderedDict()
+        scanned = 0
+        async for message in self._iter_history_messages(chat_id, reverse=False):
+            if getattr(message, "action", None) is not None:
+                if limit is not None and len(batches_by_key) >= limit:
+                    break
+                scanned += 1
+                continue
+            key: object = getattr(message, "grouped_id", None) or int(message.id)
+            if limit is not None and len(batches_by_key) >= limit and key not in batches_by_key:
+                break
+            scanned += 1
+            if key not in batches_by_key:
+                batches_by_key[key] = []
+            batches_by_key[key].append(message)
+        newest_first = [tuple(reversed(messages)) for messages in batches_by_key.values()]
+        return list(reversed(newest_first)), scanned
+
+
 class TelethonChannelReactionSender:
     def __init__(
         self,
@@ -735,8 +2570,14 @@ class TelethonChannelReactionSender:
         from telethon.tl.functions.channels import GetFullChannelRequest
         from telethon.tl.types import ChatReactionsAll, ReactionCustomEmoji, ReactionEmoji, ReactionPaid
 
-        peer = await self.client.get_input_entity(chat_id)
-        full_channel = await self.client(GetFullChannelRequest(peer))
+        try:
+            peer = await self.client.get_input_entity(chat_id)
+        finally:
+            await mark_current_session_offline(self.client)
+        try:
+            full_channel = await self.client(GetFullChannelRequest(peer))
+        finally:
+            await mark_current_session_offline(self.client)
         available = getattr(getattr(full_channel, "full_chat", None), "available_reactions", None)
         if not available:
             return []
@@ -785,7 +2626,10 @@ class TelethonChannelReactionSender:
         max_reactions: int,
         fallback_reactions: list[ReactionCandidate] | tuple[ReactionCandidate, ...] = (),
     ) -> int | ReactionSendResult:
-        peer = await self.client.get_input_entity(event.chat_id)
+        try:
+            peer = await self.client.get_input_entity(event.chat_id)
+        finally:
+            await mark_current_session_offline(self.client)
         message = event.message or SimpleNamespace(id=event.message_id, reactions=None)
         result = await smart_set_telethon_reactions(
             self.client,
@@ -1117,7 +2961,10 @@ async def refresh_telethon_message_for_reactions(client: Any, peer: Any, message
     get_messages = getattr(client, "get_messages", None)
     if get_messages is None:
         return message
-    fresh_message = await get_messages(peer, ids=int(message.id))
+    try:
+        fresh_message = await get_messages(peer, ids=int(message.id))
+    finally:
+        await mark_current_session_offline(client)
     return fresh_message or message
 
 
@@ -1228,9 +3075,12 @@ async def smart_set_telethon_reactions(
     while active_reactions:
         reaction_vector = [*installed_reactions, *active_reactions]
         try:
-            await client(
-                SendReactionRequest(peer=peer, msg_id=message.id, reaction=reaction_vector)
-            )
+            try:
+                await client(
+                    SendReactionRequest(peer=peer, msg_id=message.id, reaction=reaction_vector)
+                )
+            finally:
+                await mark_current_session_offline(client)
             return result(len(active_reactions), active_reactions)
         except Exception as error:
             error_text = str(error)
@@ -1317,6 +3167,7 @@ async def dispatch_voice_message(event: Any, registry: FeatureRegistry, context:
 
 
 DEFAULT_VOICE_QUEUE_MAXSIZE = 64
+DEFAULT_POST_MIRROR_QUEUE_MAXSIZE = 0
 
 
 class VoiceQueueWorker:
@@ -1380,6 +3231,76 @@ class VoiceQueueWorker:
                 )
             finally:
                 self._queue.task_done()
+
+
+class PostMirrorQueueWorker:
+    def __init__(
+        self,
+        handler: Callable[[Any], Awaitable[Any]],
+        *,
+        maxsize: int = DEFAULT_POST_MIRROR_QUEUE_MAXSIZE,
+        operation_gate: PostMirrorOperationGate | None = None,
+        sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+        logger_: logging.Logger | None = None,
+    ) -> None:
+        if maxsize < 0:
+            raise ValueError("maxsize must be non-negative")
+        self._handler = handler
+        self._queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=maxsize)
+        self._operation_gate = operation_gate
+        self._sleep = sleep
+        self._logger = logger_ or logger
+        self.dropped_count = 0
+        self.processed_count = 0
+
+    def submit(self, event: Any) -> bool:
+        try:
+            self._queue.put_nowait(event)
+        except asyncio.QueueFull:
+            self.dropped_count += 1
+            self._logger.warning(
+                "post_mirror_dropped_queue_full chat_id=%s message_id=%s queue_size=%s",
+                getattr(event, "chat_id", "?"),
+                getattr(getattr(event, "message", None), "id", "?"),
+                self._queue.maxsize,
+            )
+            return False
+        if self._operation_gate is not None:
+            self._operation_gate.notify_realtime_queued()
+        return True
+
+    async def run(self) -> None:
+        while True:
+            event = await self._queue.get()
+            try:
+                if self._operation_gate is None:
+                    await self._handle_event_with_flood_wait_retry(event)
+                else:
+                    async with self._operation_gate.realtime_operation():
+                        await self._handle_event_with_flood_wait_retry(event)
+                self.processed_count += 1
+            except Exception:
+                self._logger.exception(
+                    "post_mirror_consumer_handler_failed chat_id=%s",
+                    getattr(event, "chat_id", "?"),
+                )
+            finally:
+                self._queue.task_done()
+
+    async def _handle_event_with_flood_wait_retry(self, event: Any) -> None:
+        while True:
+            try:
+                await self._handler(event)
+                return
+            except telethon_errors.FloodWaitError as exc:
+                wait_seconds = post_mirror_flood_wait_delay_seconds(exc)
+                self._logger.warning(
+                    "post_mirror_realtime_flood_wait chat_id=%s message_id=%s wait_seconds=%s",
+                    getattr(event, "chat_id", "?"),
+                    getattr(getattr(event, "message", None), "id", "?"),
+                    wait_seconds,
+                )
+                await self._sleep(wait_seconds)
 
 
 DEFAULT_CHANNEL_REACTION_QUEUE_MAXSIZE = 100
@@ -1676,11 +3597,7 @@ class ChannelReactionHistoryBackfill:
                 )
                 target_reaction_count = min(max_reactions, len(target_ordered))
                 target_count = 0
-                async for message in self._client.iter_messages(
-                    target_chat_id,
-                    limit=None,
-                    wait_time=self._history_fetch_wait_seconds,
-                ):
+                async for message in self._iter_channel_history_messages(target_chat_id):
                     scanned_count += 1
                     event = self._history_event(target_chat_id, message)
                     grouped_id = getattr(message, "grouped_id", None)
@@ -1876,6 +3793,24 @@ class ChannelReactionHistoryBackfill:
                 enabled_ids.append(channel_id)
         return enabled_ids
 
+    async def _iter_channel_history_messages(self, chat_id: int) -> Any:
+        iterator = self._client.iter_messages(
+            chat_id,
+            limit=None,
+            wait_time=self._history_fetch_wait_seconds,
+        ).__aiter__()
+        try:
+            while True:
+                try:
+                    yield await iterator.__anext__()
+                except StopAsyncIteration:
+                    return
+        finally:
+            aclose = getattr(iterator, "aclose", None)
+            if callable(aclose):
+                await aclose()
+            await mark_current_session_offline(self._client, logger_=self._logger)
+
     @staticmethod
     def _history_event(chat_id: int, message: Any) -> Any:
         return SimpleNamespace(
@@ -2070,6 +4005,7 @@ async def run_user_client(
     client: Any | None = None,
     state: Any | None = None,
     reaction_history_backfill: ChannelReactionHistoryBackfill | None = None,
+    post_mirror_history_backfill: PostMirrorHistoryBackfill | None = None,
 ) -> None:  # pragma: no cover - integration only
     from telethon import TelegramClient, events
 
@@ -2081,6 +4017,18 @@ async def run_user_client(
         state = SQLiteAssistantRepository(settings.database_path)
     reaction_sender = TelethonChannelReactionSender(client, send_delay_seconds=0)
     cached_reaction_sender = CachedTelethonChannelReactionSender(reaction_sender, state)
+    post_mirror_delivery_sender = TelethonPostMirrorSender(client)
+    post_mirror_realtime_enqueuer = PostMirrorOutboxEnqueuer(state, origin="realtime")
+    post_mirror_history_enqueuer = PostMirrorOutboxEnqueuer(state, origin="history")
+    post_mirror_topic_manager = TelethonForumTopicManager(client)
+    post_mirror_online_gate = TelegramAuthorizationOnlineGate(
+        client,
+        freshness_seconds=settings.post_mirror_online_freshness_seconds,
+    )
+    gated_post_mirror_topic_manager = OnlineGatedForumTopicManager(
+        post_mirror_topic_manager,
+        post_mirror_online_gate,
+    )
     context = AssistantContext(
         blacklist=state,
         group_whitelist=state,
@@ -2096,8 +4044,12 @@ async def run_user_client(
         ),
         reaction_settings=state,
         reaction_sender=cached_reaction_sender,
+        post_mirror_settings=state,
+        post_mirror_sender=post_mirror_realtime_enqueuer,
+        post_mirror_topic_manager=gated_post_mirror_topic_manager,
+        post_mirror_defer_missing_topics=True,
     )
-    registry = FeatureRegistry([VoiceTranscriptionFeature(), ChannelReactionFeature()])
+    registry = FeatureRegistry([VoiceTranscriptionFeature(), ChannelReactionFeature(), PostMirrorFeature()])
 
     async def handle_voice(event: Any) -> None:
         await dispatch_voice_message(event, registry, context)
@@ -2105,11 +4057,28 @@ async def run_user_client(
     async def handle_channel_reaction(event: Any) -> None:
         await dispatch_channel_message(event, registry, context)
 
+    async def handle_post_mirror(event: Any) -> None:
+        await dispatch_post_mirror(event, registry, context)
+
+    post_mirror_operation_gate = PostMirrorOperationGate()
     worker = VoiceQueueWorker(handler=handle_voice)
     reaction_worker = ChannelReactionQueueWorker(
         handler=handle_channel_reaction,
         delay_range_provider=state.get_reaction_delay_range_seconds,
         post_dispatch_delay_range_seconds=CHANNEL_REACTION_POST_DISPATCH_DELAY_RANGE_SECONDS,
+    )
+    post_mirror_worker = PostMirrorQueueWorker(
+        handler=handle_post_mirror,
+        operation_gate=post_mirror_operation_gate,
+    )
+    post_mirror_delivery_worker = PostMirrorOutboxDeliveryWorker(
+        state=state,
+        client=client,
+        post_mirror_sender=post_mirror_delivery_sender,
+        online_gate=post_mirror_online_gate,
+        post_mirror_topic_manager=post_mirror_topic_manager,
+        poll_seconds=settings.post_mirror_outbox_poll_seconds,
+        delivery_delay_range_seconds=settings.post_mirror_delivery_delay_range_seconds,
     )
     if reaction_history_backfill is not None:
         reaction_history_backfill.bind(
@@ -2117,8 +4086,18 @@ async def run_user_client(
             state=state,
             reaction_sender=TelethonChannelReactionSender(client, send_delay_seconds=0),
         )
+    if post_mirror_history_backfill is not None:
+        post_mirror_history_backfill.bind(
+            client=client,
+            state=state,
+            post_mirror_sender=post_mirror_history_enqueuer,
+            post_mirror_topic_manager=gated_post_mirror_topic_manager,
+            operation_gate=post_mirror_operation_gate,
+        )
     consumer_task = asyncio.create_task(worker.run(), name="voice-queue-consumer")
     reaction_consumer_task = asyncio.create_task(reaction_worker.run(), name="channel-reaction-queue-consumer")
+    post_mirror_consumer_task = asyncio.create_task(post_mirror_worker.run(), name="post-mirror-queue-consumer")
+    post_mirror_delivery_task: asyncio.Task[None] | None = None
     premium_refresh_task = asyncio.create_task(
         refresh_account_premium_status_loop(client, state),
         name="telegram-premium-refresh",
@@ -2126,21 +4105,65 @@ async def run_user_client(
 
     @client.on(events.NewMessage())
     async def on_message(event: Any) -> None:
-        await remember_chat_from_event(event, state)
-        await remember_group_from_event(event, state)
+        title, kind = await remember_chat_from_event(event, state)
         # Only voice/video-note events should occupy the queue — text messages
         # would block voice processing for no reason.
         if is_transcribable_message(event.message):
             worker.submit(event)
         if should_enqueue_channel_reaction(event, state):
             reaction_worker.submit(event)
+        if should_enqueue_post_mirror(event, state):
+            post_mirror_worker.submit(event)
+        try:
+            await sync_post_mirror_topic_title(
+                state=state,
+                topic_manager=gated_post_mirror_topic_manager,
+                source_chat_id=int(event.chat_id),
+                title=title,
+                kind=kind,
+            )
+        except Exception:
+            logger.exception("post_mirror_topic_title_sync_failed chat_id=%s", getattr(event, "chat_id", "?"))
+        await remember_group_from_event(event, state)
+
+    @client.on(events.Album())
+    async def on_album(event: Any) -> None:
+        title, kind = await remember_chat_from_event(event, state)
+        if should_enqueue_post_mirror(event, state):
+            post_mirror_worker.submit(event)
+        try:
+            await sync_post_mirror_topic_title(
+                state=state,
+                topic_manager=gated_post_mirror_topic_manager,
+                source_chat_id=int(event.chat_id),
+                title=title,
+                kind=kind,
+            )
+        except Exception:
+            logger.exception("post_mirror_topic_title_sync_failed chat_id=%s", getattr(event, "chat_id", "?"))
+        await remember_group_from_event(event, state)
 
     try:
         await client.start()
+        await mark_current_session_offline(client)
+        post_mirror_delivery_task = asyncio.create_task(
+            post_mirror_delivery_worker.run(),
+            name="post-mirror-outbox-delivery",
+        )
         await record_account_premium_status(client, state)
         await client.run_until_disconnected()
     finally:
-        for task in (consumer_task, reaction_consumer_task, premium_refresh_task):
+        for task in tuple(
+            task
+            for task in (
+                consumer_task,
+                reaction_consumer_task,
+                post_mirror_consumer_task,
+                post_mirror_delivery_task,
+                premium_refresh_task,
+            )
+            if task is not None
+        ):
             task.cancel()
             try:
                 await task

@@ -2,18 +2,32 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 from typing import Any, Protocol
 
 from telepath.config import Settings, load_settings
-from telepath.chat_export import ChatExportDocument, ExportChat, ExportChatPage
+from telepath.chat_export import (
+    ChatExportDocument,
+    ChatMediaArchivePart,
+    ExportChat,
+    ExportChatPage,
+    chat_media_archive_caption,
+)
 from telepath.panel import PanelButton, PanelView, ControlPanelService
 from telepath.premium_emoji import extract_premium_emoji_ids, format_premium_emoji_reply
 from telepath.storage import SQLiteAssistantRepository
 
 
 logger = logging.getLogger(__name__)
+
+POST_MIRROR_HISTORY_PACE_TEXT = (
+    "История копируется безопасно: один пост раз в 60-120 сек; "
+    "после нового топика пауза 3-6 мин; realtime-посты без искусственной задержки."
+)
 CHAT_EXPORT_PAGE_SIZE = 8
 CHAT_EXPORT_SAFE_LIMIT = 5000
+CHAT_ARCHIVE_STANDARD_PART_BYTES = 1536 * 1024 * 1024
+CHAT_ARCHIVE_PREMIUM_PART_BYTES = 3584 * 1024 * 1024
 
 
 class ChatExportPort(Protocol):
@@ -27,6 +41,31 @@ class ChatExportPort(Protocol):
     ) -> ExportChatPage: ...
     async def get_chat(self, chat_id: int) -> ExportChat: ...
     async def export_chat_text(self, chat_id: int, *, limit: int | None = None) -> ChatExportDocument: ...
+    def export_chat_media_archives(
+        self,
+        chat_id: int,
+        *,
+        limit: int | None = None,
+        max_archive_bytes: int,
+    ) -> Any: ...
+    async def send_chat_archive_part(self, part: ChatMediaArchivePart, *, target_peer: Any) -> None: ...
+
+
+class ChatMediaExportSendSummary:
+    def __init__(
+        self,
+        *,
+        part_count: int = 0,
+        message_count: int = 0,
+        service_message_count: int = 0,
+        media_count: int = 0,
+        byte_count: int = 0,
+    ):
+        self.part_count = part_count
+        self.message_count = message_count
+        self.service_message_count = service_message_count
+        self.media_count = media_count
+        self.byte_count = byte_count
 
 
 class ReactionHistoryBackfillPort(Protocol):
@@ -37,6 +76,16 @@ class ReactionHistoryBackfillPort(Protocol):
         chat_id: int | None = None,
     ) -> Any: ...
     def set_completion_notifier(self, notifier: Any) -> None: ...
+
+
+class PostMirrorHistoryBackfillPort(Protocol):
+    async def enqueue_history(
+        self,
+        *,
+        limit_per_source: int | None,
+        chat_id: int | None = None,
+        folder_id: int | None = None,
+    ) -> Any: ...
 
 
 def _active_llm_model(settings: Settings) -> str | None:
@@ -106,6 +155,8 @@ async def _answer_callback_query(callback: Any, text: str | None = None) -> None
 
 def _panel_callback_ack_text(action: str, view: PanelView | None = None) -> str | None:
     state_change_prefixes = (
+        "post_mirror.toggle",
+        "post_mirror.source.toggle:",
         "reactions.channel.toggle:",
         "reactions.channel.max1:",
         "reactions.channel.max3:",
@@ -172,6 +223,45 @@ def _parse_reaction_history_backfill_action(action: str) -> tuple[int | None, in
     except ValueError:
         return None
     return None
+
+
+def _parse_post_mirror_history_backfill_action(action: str) -> tuple[int, int | None, int] | None:
+    parts = action.split(":")
+    if len(parts) != 5 or parts[0] != "pmh" or parts[1] != "ch":
+        return None
+    try:
+        chat_id = int(parts[2])
+        if parts[3] == "all":
+            limit = None
+        else:
+            limit = int(parts[3])
+            if limit <= 0:
+                return None
+        page = int(parts[4])
+        if page < 0:
+            return None
+    except ValueError:
+        return None
+    return chat_id, limit, page
+
+
+def _parse_post_mirror_folder_history_backfill_action(action: str) -> tuple[int, int | None] | None:
+    parts = action.split(":")
+    if len(parts) != 4 or parts[0] != "pmh" or parts[1] != "folder":
+        return None
+    try:
+        folder_id = int(parts[2])
+        if folder_id <= 0:
+            return None
+        if parts[3] == "all":
+            limit = None
+        else:
+            limit = int(parts[3])
+            if limit <= 0:
+                return None
+    except ValueError:
+        return None
+    return folder_id, limit
 
 
 def _append_panel_feedback(view: PanelView, feedback: str) -> PanelView:
@@ -366,6 +456,349 @@ def _reaction_history_backfill_feedback(result: Any) -> str:
     else:
         lines.append("Новых постов для обработки не нашел.")
     return "\n".join(lines)
+
+
+def _post_mirror_history_backfill_feedback(result: Any) -> str:
+    if bool(getattr(result, "duplicate_queued", False)):
+        position = getattr(result, "queue_position", None)
+        suffix = f" Позиция: {position}." if position else ""
+        return f"Такой запуск истории уже есть в очереди.{suffix}\n{POST_MIRROR_HISTORY_PACE_TEXT}"
+
+    if bool(getattr(result, "request_queued", False)):
+        position = getattr(result, "queue_position", None)
+        lines = ["История добавлена в очередь."]
+        if position:
+            lines.append(f"Позиция: {position}.")
+        lines.append(POST_MIRROR_HISTORY_PACE_TEXT)
+        return "\n".join(lines)
+
+    source_count = int(getattr(result, "source_count", 0))
+    if source_count <= 0:
+        return "Нет настроенных каналов для копирования истории."
+
+    lines = [
+        f"Постов скопировано: {int(getattr(result, 'mirrored_count', 0))}",
+        f"Просканировано: {int(getattr(result, 'scanned_count', 0))}",
+        f"Пропущено: {int(getattr(result, 'skipped_count', 0))}",
+        f"Источников: {source_count}",
+    ]
+    failed_count = int(getattr(result, "failed_count", 0))
+    if failed_count:
+        lines.append(f"Ошибок: {failed_count}")
+    lines.append("История обработана последовательно: один пост раз в 60-120 сек.")
+    return "\n".join(lines)
+
+
+def _post_mirror_source_title(state: SQLiteAssistantRepository, source_chat_id: int) -> tuple[str, str]:
+    for chat in state.list_known_chats():
+        if int(chat["chat_id"]) == source_chat_id:
+            return str(chat.get("title") or source_chat_id), str(chat.get("kind") or "channel")
+    for source in state.list_post_mirror_sources():
+        if int(source["source_chat_id"]) == source_chat_id:
+            return str(source.get("title") or source_chat_id), str(source.get("kind") or "channel")
+    return str(source_chat_id), "channel"
+
+
+async def _render_post_mirror_topic_create_action(
+    *,
+    user_id: int,
+    action: str,
+    panel: ControlPanelService,
+    state: SQLiteAssistantRepository,
+    chat_exporter: ChatExportPort | None,
+    topic_manager_factory: Any | None = None,
+) -> PanelView:
+    if user_id != panel.owner_id:
+        return PanelView(text="Доступ запрещен.", keyboard=[])
+    parts = action.split(":")
+    if len(parts) != 3 or parts[0] != "pm.topic":
+        return panel.handle_action(user_id=user_id, action="post_mirror.sources")
+    try:
+        source_chat_id = int(parts[1])
+        page = int(parts[2])
+    except ValueError:
+        return panel.handle_action(user_id=user_id, action="post_mirror.sources")
+
+    detail_action = f"post_mirror.source:{source_chat_id}:{page}"
+    view = panel.handle_action(user_id=user_id, action=detail_action)
+    target_chat_id = state.get_post_mirror_target_chat_id()
+    if target_chat_id is None:
+        return _append_panel_feedback(view, "Сначала задай группу с топиками.")
+    if int(source_chat_id) == int(target_chat_id):
+        return _append_panel_feedback(view, "Нельзя копировать группу саму в себя.")
+    client = getattr(chat_exporter, "client", None)
+    if client is None:
+        return _append_panel_feedback(view, "Не могу создать топик: Telegram user client недоступен.")
+
+    title, kind = _post_mirror_source_title(state, source_chat_id)
+    try:
+        if topic_manager_factory is None:
+            from telepath.user_client import TelethonForumTopicManager
+
+            topic_manager_factory = TelethonForumTopicManager
+        topic_id = await topic_manager_factory(client).create_topic(target_chat_id, title)
+    except Exception as error:
+        logger.exception("post_mirror_topic_create_failed source_chat_id=%s", source_chat_id)
+        refreshed = panel.handle_action(user_id=user_id, action=detail_action)
+        return _append_panel_feedback(refreshed, f"Не смог создать топик: {error}")
+
+    state.upsert_post_mirror_source(source_chat_id, title, kind)
+    state.set_post_mirror_source_topic(source_chat_id, topic_id)
+    state.set_post_mirror_source_enabled(source_chat_id, True)
+    refreshed = panel.handle_action(user_id=user_id, action=detail_action)
+    return _append_panel_feedback(refreshed, f"Топик создан: {topic_id}. Источник включен.")
+
+
+async def _render_post_mirror_source_refresh_action(
+    *,
+    user_id: int,
+    panel: ControlPanelService,
+    state: SQLiteAssistantRepository,
+    chat_exporter: ChatExportPort | None,
+    topic_manager_factory: Any | None = None,
+) -> PanelView:
+    view = panel.handle_action(user_id=user_id, action="post_mirror.sources")
+    if user_id != panel.owner_id:
+        return view
+    client = getattr(chat_exporter, "client", None)
+    if client is None:
+        return _append_panel_feedback(view, "Не могу обновить каталог: Telegram user client недоступен.")
+    try:
+        from telepath.user_client import TelethonForumTopicManager, sync_chat_catalog
+
+        if topic_manager_factory is None:
+            topic_manager_factory = TelethonForumTopicManager
+        await sync_chat_catalog(client, state, post_mirror_topic_manager=topic_manager_factory(client))
+    except Exception as error:
+        logger.exception("post_mirror_source_refresh_failed")
+        refreshed = panel.handle_action(user_id=user_id, action="post_mirror.sources")
+        return _append_panel_feedback(refreshed, f"Не смог обновить каталог: {error}")
+    refreshed = panel.handle_action(user_id=user_id, action="post_mirror.sources")
+    return _append_panel_feedback(refreshed, "Каталог обновлен.")
+
+
+async def _render_post_mirror_folder_refresh_action(
+    *,
+    user_id: int,
+    panel: ControlPanelService,
+    state: SQLiteAssistantRepository,
+    chat_exporter: ChatExportPort | None,
+) -> PanelView:
+    view = panel.handle_action(user_id=user_id, action="post_mirror.folders")
+    if user_id != panel.owner_id:
+        return view
+    client = getattr(chat_exporter, "client", None)
+    if client is None:
+        return _append_panel_feedback(view, "Не могу обновить папки: Telegram user client недоступен.")
+    try:
+        from telepath.user_client import sync_reaction_folders
+
+        await sync_reaction_folders(client, state)
+    except Exception as error:
+        logger.exception("post_mirror_folder_refresh_failed")
+        refreshed = panel.handle_action(user_id=user_id, action="post_mirror.folders")
+        return _append_panel_feedback(refreshed, f"Не смог обновить папки: {error}")
+    refreshed = panel.handle_action(user_id=user_id, action="post_mirror.folders")
+    return _append_panel_feedback(refreshed, "Папки обновлены.")
+
+
+async def _render_post_mirror_folder_toggle_action(
+    *,
+    user_id: int,
+    action: str,
+    panel: ControlPanelService,
+    state: SQLiteAssistantRepository,
+) -> PanelView:
+    if user_id != panel.owner_id:
+        return PanelView(text="Доступ запрещен.", keyboard=[])
+    parts = action.split(":")
+    if len(parts) != 2 or parts[0] != "pmf.toggle":
+        return panel.handle_action(user_id=user_id, action="post_mirror.folders")
+    try:
+        folder_id = int(parts[1])
+    except ValueError:
+        return panel.handle_action(user_id=user_id, action="post_mirror.folders")
+
+    folder = next(
+        (item for item in state.list_post_mirror_folders() if int(item["folder_id"]) == folder_id),
+        None,
+    )
+    if folder is None:
+        return _append_panel_feedback(
+            panel.handle_action(user_id=user_id, action="post_mirror.folders"),
+            "Папка не найдена. Обнови список папок.",
+        )
+    detail_action = f"post_mirror.folder:{folder_id}"
+    if folder["enabled"]:
+        state.set_post_mirror_folder_enabled(folder_id, False)
+        return _append_panel_feedback(
+            panel.handle_action(user_id=user_id, action=detail_action),
+            "Папка выключена.",
+        )
+    if state.get_post_mirror_target_chat_id() is None:
+        return _append_panel_feedback(
+            panel.handle_action(user_id=user_id, action=detail_action),
+            "Сначала задай группу с топиками.",
+        )
+    if not state.list_post_mirror_folder_sources(folder_id):
+        return _append_panel_feedback(
+            panel.handle_action(user_id=user_id, action=detail_action),
+            "В папке нет каналов или групп для копирования.",
+        )
+    state.set_post_mirror_folder_enabled(folder_id, True)
+    return _append_panel_feedback(
+        panel.handle_action(user_id=user_id, action=detail_action),
+        "Папка включена. Топики будут создаваться при первых постах.",
+    )
+
+
+async def _render_post_mirror_source_add_text(
+    *,
+    user_id: int,
+    text: str,
+    panel: ControlPanelService,
+    state: SQLiteAssistantRepository,
+    chat_exporter: ChatExportPort | None,
+    topic_manager_factory: Any | None = None,
+) -> PanelView:
+    if user_id != panel.owner_id:
+        return PanelView(text="Доступ запрещен.", keyboard=[])
+    try:
+        source_chat_id = int(text.strip())
+    except ValueError:
+        return PanelView(
+            text="channel_id должен быть числом.\n\nПример: -1001234567890",
+            keyboard=[[PanelButton("Повторить", "post_mirror.source.add")], [PanelButton("Назад", "back")]],
+            input_state="post_mirror_source_add",
+            action="post_mirror.source.add",
+        )
+    target_chat_id = state.get_post_mirror_target_chat_id()
+    if target_chat_id is None:
+        return _append_panel_feedback(
+            panel.handle_action(user_id=user_id, action="post_mirror"),
+            "Сначала задай группу с топиками.",
+        )
+    if int(source_chat_id) == int(target_chat_id):
+        return PanelView(
+            text="Нельзя копировать группу саму в себя.\n\nПришли другой channel_id.",
+            keyboard=[[PanelButton("Повторить", "post_mirror.source.add")], [PanelButton("К списку", "post_mirror.sources")]],
+            input_state="post_mirror_source_add",
+            action="post_mirror.source.add",
+        )
+    client = getattr(chat_exporter, "client", None)
+    if chat_exporter is None or client is None:
+        return _append_panel_feedback(
+            panel.handle_action(user_id=user_id, action="post_mirror.sources"),
+            "Не могу проверить канал: Telegram user client недоступен.",
+        )
+    try:
+        chat = await chat_exporter.get_chat(source_chat_id)
+    except Exception as error:
+        logger.exception("post_mirror_source_add_get_chat_failed source_chat_id=%s", source_chat_id)
+        return PanelView(
+            text=f"Не смог найти канал: {error}\n\nПришли другой channel_id.",
+            keyboard=[[PanelButton("Повторить", "post_mirror.source.add")], [PanelButton("К списку", "post_mirror.sources")]],
+            input_state="post_mirror_source_add",
+            action="post_mirror.source.add",
+        )
+    if chat.kind not in {"channel", "group"}:
+        return PanelView(
+            text="Этот чат нельзя включить для копирования постов.\n\nНужен Telegram-канал или группа.",
+            keyboard=[[PanelButton("Повторить", "post_mirror.source.add")], [PanelButton("К списку", "post_mirror.sources")]],
+            input_state="post_mirror_source_add",
+            action="post_mirror.source.add",
+        )
+
+    state.upsert_known_chat(chat.chat_id, chat.title, chat.kind)
+    state.upsert_post_mirror_source(chat.chat_id, chat.title, chat.kind)
+    try:
+        if topic_manager_factory is None:
+            from telepath.user_client import TelethonForumTopicManager
+
+            topic_manager_factory = TelethonForumTopicManager
+        topic_id = await topic_manager_factory(client).create_topic(target_chat_id, chat.title)
+    except Exception as error:
+        logger.exception("post_mirror_source_add_topic_failed source_chat_id=%s", source_chat_id)
+        view = panel.handle_action(user_id=user_id, action=f"post_mirror.source:{chat.chat_id}:0")
+        return _append_panel_feedback(view, f"Канал добавлен, но топик не создан: {error}")
+
+    state.set_post_mirror_source_topic(chat.chat_id, topic_id)
+    state.set_post_mirror_source_enabled(chat.chat_id, True)
+    return _append_panel_feedback(
+        panel.handle_action(user_id=user_id, action=f"post_mirror.source:{chat.chat_id}:0"),
+        f"Канал добавлен. Топик создан: {topic_id}.",
+    )
+
+
+async def _render_post_mirror_history_backfill_action(
+    *,
+    user_id: int,
+    action: str,
+    panel: ControlPanelService,
+    post_mirror_history_backfill: PostMirrorHistoryBackfillPort | None,
+) -> PanelView:
+    if user_id != panel.owner_id:
+        return PanelView(text="Доступ запрещен.", keyboard=[])
+    parsed = _parse_post_mirror_history_backfill_action(action)
+    if parsed is None:
+        return panel.handle_action(user_id=user_id, action="post_mirror.sources")
+    source_chat_id, limit, page = parsed
+    detail_action = f"post_mirror.source:{source_chat_id}:{page}"
+    view = panel.handle_action(user_id=user_id, action=detail_action)
+    if post_mirror_history_backfill is None:
+        return _append_panel_feedback(view, "Telegram user client недоступен: история не запущена.")
+    try:
+        result = await post_mirror_history_backfill.enqueue_history(
+            limit_per_source=limit,
+            chat_id=source_chat_id,
+        )
+    except Exception as error:
+        logger.exception("post_mirror_history_enqueue_failed source_chat_id=%s", source_chat_id)
+        refreshed = panel.handle_action(user_id=user_id, action=detail_action)
+        return _append_panel_feedback(refreshed, f"Не смог запустить историю: {error}")
+    refreshed = panel.handle_action(user_id=user_id, action=detail_action)
+    return _append_panel_feedback(refreshed, _post_mirror_history_backfill_feedback(result))
+
+
+async def _render_post_mirror_folder_history_backfill_action(
+    *,
+    user_id: int,
+    action: str,
+    panel: ControlPanelService,
+    post_mirror_history_backfill: PostMirrorHistoryBackfillPort | None,
+) -> PanelView:
+    if user_id != panel.owner_id:
+        return PanelView(text="Доступ запрещен.", keyboard=[])
+    parsed = _parse_post_mirror_folder_history_backfill_action(action)
+    if parsed is None:
+        return panel.handle_action(user_id=user_id, action="post_mirror.folders")
+    folder_id, limit = parsed
+    detail_action = f"post_mirror.folder:{folder_id}"
+    view = panel.handle_action(user_id=user_id, action=detail_action)
+    folder = next(
+        (item for item in panel.state.list_post_mirror_folders() if int(item["folder_id"]) == folder_id),
+        None,
+    )
+    if folder is None:
+        return _append_panel_feedback(
+            panel.handle_action(user_id=user_id, action="post_mirror.folders"),
+            "Папка не найдена. Обнови список папок.",
+        )
+    if not folder["enabled"]:
+        return _append_panel_feedback(view, "Сначала включи папку.")
+    if post_mirror_history_backfill is None:
+        return _append_panel_feedback(view, "Telegram user client недоступен: история не запущена.")
+    try:
+        result = await post_mirror_history_backfill.enqueue_history(
+            limit_per_source=limit,
+            folder_id=folder_id,
+        )
+    except Exception as error:
+        logger.exception("post_mirror_folder_history_enqueue_failed folder_id=%s", folder_id)
+        refreshed = panel.handle_action(user_id=user_id, action=detail_action)
+        return _append_panel_feedback(refreshed, f"Не смог запустить историю: {error}")
+    refreshed = panel.handle_action(user_id=user_id, action=detail_action)
+    return _append_panel_feedback(refreshed, _post_mirror_history_backfill_feedback(result))
 
 
 def _reaction_history_backfill_completion_message(result: Any, *, channel_title: str | None = None) -> str:
@@ -595,12 +1028,55 @@ def _chat_export_detail_view(chat: ExportChat, *, page: int, mode: str = "all") 
         keyboard=[
             [PanelButton("Последние 1 000", _confirm_export_action(chat.chat_id, page, mode, limit=1000))],
             [PanelButton("Последние 5 000", _confirm_export_action(chat.chat_id, page, mode, limit=5000))],
+            [PanelButton(".zip с медиа · 1 000", _media_export_action(chat.chat_id, page, mode, limit=1000))],
+            [PanelButton(".zip с медиа · 5 000", _media_export_action(chat.chat_id, page, mode, limit=5000))],
             [PanelButton("Вся история", _full_history_action(chat.chat_id, page, mode))],
+            [PanelButton("Вся история с медиа", _media_export_action(chat.chat_id, page, mode, limit=None))],
             [PanelButton("Другой лимит", _export_limit_action(chat.chat_id, page, mode))],
             [PanelButton("К списку чатов", _chat_export_page_action(page, mode))],
             [PanelButton("Назад", "back")],
         ],
         action=_export_chat_action(chat.chat_id, page, mode),
+    )
+
+
+def _chat_media_export_warning_view(
+    chat: ExportChat,
+    *,
+    page: int,
+    mode: str = "all",
+    limit: int | None,
+    is_premium: bool,
+) -> PanelView:
+    mode = _normalize_export_mode(mode)
+    limit_label = _export_limit_label(limit)
+    part_limit = _format_bytes(_chat_media_archive_limit_bytes(is_premium))
+    return PanelView(
+        text="\n".join(
+            [
+                "Архив с медиа",
+                "",
+                f"Название: {chat.title}",
+                f"chat_id: {chat.chat_id}",
+                f"Объем: {limit_label}",
+                f"Размер части: до {part_limit}",
+                "",
+                "Файлы отправляет Telegram user account в личный чат с manager-ботом. "
+                "После отправки zip-части и исходные файлы удаляются с сервера.",
+            ]
+        ),
+        keyboard=[
+            [
+                PanelButton(
+                    "Создать .zip с медиа",
+                    _confirm_media_export_action(chat.chat_id, page, mode, limit=limit),
+                )
+            ],
+            [PanelButton("Лучше .txt без медиа", _confirm_export_action(chat.chat_id, page, mode, limit=limit))],
+            [PanelButton("К карточке чата", _export_chat_action(chat.chat_id, page, mode))],
+            [PanelButton("К списку чатов", _chat_export_page_action(page, mode))],
+        ],
+        action=_media_export_action(chat.chat_id, page, mode, limit=limit),
     )
 
 
@@ -755,6 +1231,34 @@ def _chat_export_done_view(
     )
 
 
+def _chat_media_export_done_view(
+    *,
+    chat_id: int,
+    page: int,
+    summary: ChatMediaExportSendSummary,
+    mode: str = "all",
+) -> PanelView:
+    return PanelView(
+        text="\n".join(
+            [
+                "Отправил архивы с медиа.",
+                f"Частей: {_format_int_grouped(summary.part_count)}",
+                f"Сообщений: {_format_int_grouped(summary.message_count)}",
+                f"Сервисных событий пропущено: {_format_int_grouped(summary.service_message_count)}",
+                f"Медиафайлов: {_format_int_grouped(summary.media_count)}",
+                f"Общий размер: {_format_bytes(summary.byte_count)}",
+                "Файлы на сервере удалены.",
+            ]
+        ),
+        keyboard=[
+            [PanelButton("К карточке чата", _export_chat_action(chat_id, page, mode))],
+            [PanelButton("К списку чатов", _chat_export_page_action(page, mode))],
+            [PanelButton("Назад", "back")],
+        ],
+        action="export.chats",
+    )
+
+
 def _chat_export_error_view(message: str) -> PanelView:
     return PanelView(
         text=f"Не смог выгрузить чат.\n\n{message}",
@@ -830,6 +1334,32 @@ def _parse_confirm_export_action(action: str) -> tuple[int, int, str, int | None
         return None
 
 
+def _parse_media_export_action(action: str) -> tuple[int, int, str, int | None] | None:
+    parts = action.split(":")
+    if len(parts) != 5 or parts[0] != "export.media":
+        return None
+    try:
+        parsed_limit = _parse_export_limit_token(parts[4])
+        if not parsed_limit[0]:
+            return None
+        return int(parts[1]), int(parts[2]), _normalize_export_mode(parts[3]), parsed_limit[1]
+    except ValueError:
+        return None
+
+
+def _parse_confirm_media_export_action(action: str) -> tuple[int, int, str, int | None] | None:
+    parts = action.split(":")
+    if len(parts) != 5 or parts[0] != "export.media.confirm":
+        return None
+    try:
+        parsed_limit = _parse_export_limit_token(parts[4])
+        if not parsed_limit[0]:
+            return None
+        return int(parts[1]), int(parts[2]), _normalize_export_mode(parts[3]), parsed_limit[1]
+    except ValueError:
+        return None
+
+
 def _parse_export_limit_action(action: str) -> tuple[int, int, str] | None:
     parts = action.split(":")
     if len(parts) != 4 or parts[0] != "export.limit":
@@ -890,6 +1420,18 @@ def _confirm_export_action(chat_id: int, page: int, mode: str = "all", *, limit:
     return f"export.confirm:{chat_id}:{page}:{mode}:{limit_part}"
 
 
+def _media_export_action(chat_id: int, page: int, mode: str = "all", *, limit: int | None = None) -> str:
+    mode = _normalize_export_mode(mode)
+    limit_part = str(limit) if limit is not None else "all"
+    return f"export.media:{chat_id}:{page}:{mode}:{limit_part}"
+
+
+def _confirm_media_export_action(chat_id: int, page: int, mode: str = "all", *, limit: int | None = None) -> str:
+    mode = _normalize_export_mode(mode)
+    limit_part = str(limit) if limit is not None else "all"
+    return f"export.media.confirm:{chat_id}:{page}:{mode}:{limit_part}"
+
+
 def _export_limit_action(chat_id: int, page: int, mode: str = "all") -> str:
     return f"export.limit:{chat_id}:{page}:{_normalize_export_mode(mode)}"
 
@@ -906,6 +1448,10 @@ def _export_limit_label(limit: int | None) -> str:
     return f"последние {_format_int_grouped(limit)} сообщений"
 
 
+def _chat_media_archive_limit_bytes(is_premium: bool) -> int:
+    return CHAT_ARCHIVE_PREMIUM_PART_BYTES if is_premium else CHAT_ARCHIVE_STANDARD_PART_BYTES
+
+
 def _format_int_grouped(value: int) -> str:
     return f"{value:,}".replace(",", " ")
 
@@ -917,7 +1463,10 @@ def _format_bytes(byte_count: int) -> str:
     if kib < 1024:
         return f"{kib:.1f} KB"
     mib = kib / 1024
-    return f"{mib:.1f} MB"
+    if mib < 1024:
+        return f"{mib:.1f} MB"
+    gib = mib / 1024
+    return f"{gib:.1f} GB"
 
 
 def _chat_export_caption(document: ChatExportDocument) -> str:
@@ -928,6 +1477,10 @@ def _chat_export_caption(document: ChatExportDocument) -> str:
         f"Размер: {_format_bytes(len(document.data))}",
     ]
     return "\n".join(lines)
+
+
+def _chat_media_archive_caption(part: ChatMediaArchivePart) -> str:
+    return chat_media_archive_caption(part)
 
 
 def _chat_export_page_action(page: int, mode: str = "all") -> str:
@@ -969,6 +1522,103 @@ async def _send_chat_export_document(message, document: ChatExportDocument) -> N
     await message.answer_document(
         BufferedInputFile(document.data, filename=document.filename),
         caption=_chat_export_caption(document),
+    )
+
+
+async def _chat_archive_upload_target(bot: Any) -> str:
+    me = await bot.get_me()
+    username = (getattr(me, "username", None) or "").strip()
+    if not username:
+        raise RuntimeError("Manager bot username is unavailable; cannot send archive from user account.")
+    return f"@{username}"
+
+
+async def _send_chat_media_archives_to_peer(
+    chat_exporter: ChatExportPort,
+    *,
+    target_peer: Any,
+    chat_id: int,
+    limit: int | None,
+    max_archive_bytes: int,
+) -> ChatMediaExportSendSummary:
+    queue: asyncio.Queue[ChatMediaArchivePart | object] = asyncio.Queue(maxsize=1)
+    finished = object()
+    producer_errors: list[BaseException] = []
+    temporary_parents: set[Any] = set()
+
+    async def produce() -> None:
+        try:
+            async for part in chat_exporter.export_chat_media_archives(
+                chat_id,
+                limit=limit,
+                max_archive_bytes=max_archive_bytes,
+            ):
+                await queue.put(part)
+        except BaseException as error:
+            producer_errors.append(error)
+        finally:
+            await queue.put(finished)
+
+    producer = asyncio.create_task(produce(), name="chat-media-export-producer")
+    summary = ChatMediaExportSendSummary()
+    try:
+        while True:
+            item = await queue.get()
+            if item is finished:
+                break
+            part = item
+            if not isinstance(part, ChatMediaArchivePart):
+                continue
+            if part.temporary_parent is not None:
+                temporary_parents.add(part.temporary_parent)
+            try:
+                await chat_exporter.send_chat_archive_part(part, target_peer=target_peer)
+                summary.part_count += 1
+                summary.message_count += part.message_count
+                summary.service_message_count += part.service_message_count
+                summary.media_count += part.media_count
+                summary.byte_count += part.byte_count
+            finally:
+                part.path.unlink(missing_ok=True)
+        await producer
+        if producer_errors:
+            raise producer_errors[0]
+        return summary
+    except BaseException:
+        producer.cancel()
+        await asyncio.gather(producer, return_exceptions=True)
+        await _delete_queued_archive_parts(queue, temporary_parents=temporary_parents)
+        raise
+    finally:
+        for parent in temporary_parents:
+            shutil.rmtree(parent, ignore_errors=True)
+
+
+async def _delete_queued_archive_parts(
+    queue: asyncio.Queue[ChatMediaArchivePart | object],
+    *,
+    temporary_parents: set[Any],
+) -> None:
+    while True:
+        try:
+            item = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
+        if isinstance(item, ChatMediaArchivePart):
+            if item.temporary_parent is not None:
+                temporary_parents.add(item.temporary_parent)
+            item.path.unlink(missing_ok=True)
+
+
+def _is_user_account_archive_upload_message(message: Any) -> bool:
+    caption = (getattr(message, "caption", None) or "").strip()
+    document = getattr(message, "document", None)
+    filename = (getattr(document, "file_name", None) or "").strip()
+    return (
+        caption.startswith("Telepath archive export")
+        and filename.startswith("telegram-")
+        and "-part" in filename
+        and filename.endswith(".zip")
     )
 
 
@@ -1015,6 +1665,7 @@ async def run_manager_bot(
     *,
     chat_exporter: ChatExportPort | None = None,
     reaction_history_backfill: ReactionHistoryBackfillPort | None = None,
+    post_mirror_history_backfill: PostMirrorHistoryBackfillPort | None = None,
 ) -> None:  # pragma: no cover - integration only
     from aiogram import Bot, Dispatcher, F, types
 
@@ -1118,6 +1769,23 @@ async def run_manager_bot(
                 logger.exception("chat_export_get_chat_failed chat_id=%s", chat_id)
                 return _chat_export_error_view(_chat_export_exception_message(error))
             return _chat_export_full_history_warning_view(chat, page=page, mode=mode)
+        if action.startswith("export.media:"):
+            parsed = _parse_media_export_action(action)
+            if parsed is None:
+                return _chat_export_error_view("Некорректный chat_id.")
+            chat_id, page, mode, limit = parsed
+            try:
+                chat = await chat_exporter.get_chat(chat_id)
+            except Exception as error:
+                logger.exception("chat_export_get_chat_failed chat_id=%s", chat_id)
+                return _chat_export_error_view(_chat_export_exception_message(error))
+            return _chat_media_export_warning_view(
+                chat,
+                page=page,
+                mode=mode,
+                limit=limit,
+                is_premium=state.is_account_premium(),
+            )
         if action.startswith("export.chat:"):
             parsed = _parse_export_chat_action(action)
             if parsed is None:
@@ -1151,10 +1819,118 @@ async def run_manager_bot(
             byte_count=len(document.data),
         )
 
+    async def export_chat_media_to_user_account_peer(
+        message,
+        *,
+        chat_id: int,
+        page: int,
+        mode: str,
+        limit: int | None,
+    ) -> PanelView:
+        if chat_exporter is None:
+            return _chat_export_error_view("Экспорт не подключен.")
+        try:
+            target_peer = await _chat_archive_upload_target(bot)
+            summary = await _send_chat_media_archives_to_peer(
+                chat_exporter,
+                target_peer=target_peer,
+                chat_id=chat_id,
+                limit=limit,
+                max_archive_bytes=_chat_media_archive_limit_bytes(state.is_account_premium()),
+            )
+        except Exception as error:
+            logger.exception("chat_media_export_failed chat_id=%s", chat_id)
+            return _chat_export_error_view(_chat_export_exception_message(error))
+        return _chat_media_export_done_view(
+            chat_id=chat_id,
+            page=page,
+            mode=mode,
+            summary=summary,
+        )
+
     @dispatcher.callback_query(F.data.startswith("panel:"))
     async def handle_panel_callback(callback: types.CallbackQuery) -> None:
         user_id = callback.from_user.id if callback.from_user else 0
         requested_action = (callback.data or "").removeprefix("panel:")
+        if requested_action.startswith("pm.topic:"):
+            await _answer_callback_query(callback, "Создаю топик...")
+            view = await _render_post_mirror_topic_create_action(
+                user_id=user_id,
+                action=requested_action,
+                panel=panel,
+                state=state,
+                chat_exporter=chat_exporter,
+            )
+            navigation.visit(user_id=user_id, action=view.action)
+            remember_input(user_id, view)
+            if callback.message:
+                await _edit_panel_message(callback.message, view)
+            return
+        if requested_action == "pm.refresh":
+            await _answer_callback_query(callback, "Обновляю каталог...")
+            view = await _render_post_mirror_source_refresh_action(
+                user_id=user_id,
+                panel=panel,
+                state=state,
+                chat_exporter=chat_exporter,
+            )
+            navigation.visit(user_id=user_id, action=view.action)
+            remember_input(user_id, view)
+            if callback.message:
+                await _edit_panel_message(callback.message, view)
+            return
+        if requested_action == "pmf.refresh":
+            await _answer_callback_query(callback, "Обновляю папки...")
+            view = await _render_post_mirror_folder_refresh_action(
+                user_id=user_id,
+                panel=panel,
+                state=state,
+                chat_exporter=chat_exporter,
+            )
+            navigation.visit(user_id=user_id, action=view.action)
+            remember_input(user_id, view)
+            if callback.message:
+                await _edit_panel_message(callback.message, view)
+            return
+        if requested_action.startswith("pmf.toggle:"):
+            await _answer_callback_query(callback, "Настраиваю папку...")
+            view = await _render_post_mirror_folder_toggle_action(
+                user_id=user_id,
+                action=requested_action,
+                panel=panel,
+                state=state,
+            )
+            navigation.visit(user_id=user_id, action=view.action)
+            remember_input(user_id, view)
+            if callback.message:
+                await _edit_panel_message(callback.message, view)
+            return
+        if requested_action.startswith("pmh:folder:"):
+            await _answer_callback_query(callback, "Запускаю историю папки...")
+            view = await _render_post_mirror_folder_history_backfill_action(
+                user_id=user_id,
+                action=requested_action,
+                panel=panel,
+                post_mirror_history_backfill=post_mirror_history_backfill,
+            )
+            navigation.visit(user_id=user_id, action=view.action)
+            remember_input(user_id, view)
+            if callback.message:
+                await _edit_panel_message(callback.message, view)
+            return
+        if requested_action.startswith("pmh:"):
+            await _answer_callback_query(callback, "Запускаю историю...")
+            view = await _render_post_mirror_history_backfill_action(
+                user_id=user_id,
+                action=requested_action,
+                panel=panel,
+                post_mirror_history_backfill=post_mirror_history_backfill,
+            )
+            navigation.visit(user_id=user_id, action=view.action)
+            remember_input(user_id, view)
+            if callback.message:
+                await _edit_panel_message(callback.message, view)
+            return
         if requested_action.startswith("rhb:"):
             await _answer_callback_query(callback, "Запускаю историю...")
             view = await _render_reaction_history_backfill_action(
@@ -1211,7 +1987,30 @@ async def run_manager_bot(
             return
         if requested_action.startswith("export."):
             callback_answered = False
-            if requested_action.startswith("export.confirm:"):
+            if requested_action.startswith("export.media.confirm:"):
+                parsed = _parse_confirm_media_export_action(requested_action)
+                if parsed is None:
+                    view = _chat_export_error_view("Некорректный chat_id.")
+                elif callback.message is None:
+                    view = _chat_export_error_view("Нет сообщения для ответа файлом.")
+                else:
+                    chat_id, page, mode, limit = parsed
+                    await _answer_callback_query(callback, "Готовлю .zip...")
+                    callback_answered = True
+                    await callback.message.edit_text(
+                        f"Готовлю .zip с медиа: {_export_limit_label(limit)}..."
+                    )
+                    view = await export_chat_media_to_user_account_peer(
+                        callback.message,
+                        chat_id=chat_id,
+                        page=page,
+                        mode=mode,
+                        limit=limit,
+                    )
+                    remember_input(user_id, view)
+                    await _edit_panel_message(callback.message, view)
+                    return
+            elif requested_action.startswith("export.confirm:"):
                 parsed = _parse_confirm_export_action(requested_action)
                 if parsed is None:
                     view = _chat_export_error_view("Некорректный chat_id.")
@@ -1272,6 +2071,9 @@ async def run_manager_bot(
             view = panel.main(user_id=user_id)
             navigation.reset(user_id=user_id)
         else:
+            if user_id == settings.owner_id and _is_user_account_archive_upload_message(message):
+                await message.answer("Файл отправлен. Архив уже в этом чате, его можно скачать или переслать.")
+                return
             premium_emojis = extract_premium_emoji_ids(message)
             if user_id == settings.owner_id and premium_emojis:
                 await message.answer(format_premium_emoji_reply(premium_emojis))
@@ -1355,6 +2157,14 @@ async def run_manager_bot(
                             mode=mode,
                             limit=limit,
                         )
+            elif pending_input.get(user_id) == "post_mirror_source_add":
+                view = await _render_post_mirror_source_add_text(
+                    user_id=user_id,
+                    text=text,
+                    panel=panel,
+                    state=state,
+                    chat_exporter=chat_exporter,
+                )
             else:
                 view = panel.handle_text(user_id=user_id, state=pending_input.get(user_id), text=text)
             navigation.visit(user_id=user_id, action=view.action)

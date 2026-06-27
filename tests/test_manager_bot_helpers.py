@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from telepath.chat_export import ExportChat
 from telepath.config import Settings
 from telepath.features.channel_reactions import ReactionCandidate
 from telepath.manager_bot import (
@@ -7,12 +8,20 @@ from telepath.manager_bot import (
     _bind_reaction_history_completion_notifier,
     _is_callback_query_expired_error,
     _is_message_not_modified_error,
+    _parse_post_mirror_history_backfill_action,
     _parse_reaction_available_refresh_action,
     _parse_reaction_history_backfill_action,
     _panel_callback_ack_text,
     _panel_markup,
+    _post_mirror_history_backfill_feedback,
     _reaction_history_backfill_completion_message,
     _reaction_history_backfill_feedback,
+    _render_post_mirror_folder_history_backfill_action,
+    _render_post_mirror_folder_toggle_action,
+    _render_post_mirror_history_backfill_action,
+    _render_post_mirror_source_add_text,
+    _render_post_mirror_source_refresh_action,
+    _render_post_mirror_topic_create_action,
     _render_reaction_folder_refresh_action,
     _render_reaction_channel_detail_action,
     _render_reaction_history_backfill_action,
@@ -233,6 +242,329 @@ async def test_render_reaction_history_backfill_action_reports_split_runtime(tmp
     )
 
     assert "Telegram user client недоступен" in view.text
+
+
+def test_parse_post_mirror_history_backfill_action():
+    assert _parse_post_mirror_history_backfill_action("pmh:ch:-100123:1000:2") == (-100123, 1000, 2)
+    assert _parse_post_mirror_history_backfill_action("pmh:ch:-100123:all:2") == (-100123, None, 2)
+    assert _parse_post_mirror_history_backfill_action("pmh:ch:-100123:0:2") is None
+    assert _parse_post_mirror_history_backfill_action("pmh:folder:2:all") is None
+    assert _parse_post_mirror_history_backfill_action("rhb:ch:-100123:1000:2") is None
+
+
+async def test_render_post_mirror_topic_create_action_creates_topic_and_enables_source(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.set_post_mirror_target_chat_id(-100900)
+    repo.upsert_known_chat(-100123, "Source Channel", "channel")
+    panel = ControlPanelService(owner_id=10, state=repo)
+
+    class FakeTopicManager:
+        def __init__(self, client):
+            self.client = client
+
+        async def create_topic(self, target_chat_id, title):
+            assert target_chat_id == -100900
+            assert title == "Source Channel"
+            return 77
+
+    view = await _render_post_mirror_topic_create_action(
+        user_id=10,
+        action="pm.topic:-100123:0",
+        panel=panel,
+        state=repo,
+        chat_exporter=type("Exporter", (), {"client": object()})(),
+        topic_manager_factory=FakeTopicManager,
+    )
+
+    settings = repo.get_post_mirror_source_settings(-100123)
+    assert settings.target_thread_id == 77
+    assert settings.enabled is True
+    assert "Топик: 77" in view.text
+    assert "Топик создан" in view.text
+
+
+async def test_render_post_mirror_history_backfill_action_enqueues_history(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.set_post_mirroring_enabled(True)
+    repo.set_post_mirror_target_chat_id(-100900)
+    repo.upsert_known_chat(-100123, "Source Channel", "channel")
+    repo.upsert_post_mirror_source(-100123, "Source Channel", "channel")
+    repo.set_post_mirror_source_topic(-100123, 77)
+    panel = ControlPanelService(owner_id=10, state=repo)
+
+    class FakeBackfill:
+        def __init__(self):
+            self.calls = []
+
+        async def enqueue_history(self, *, limit_per_source, chat_id=None):
+            self.calls.append((limit_per_source, chat_id))
+            return type(
+                "Result",
+                (),
+                {
+                    "request_queued": True,
+                    "queue_position": 1,
+                    "source_count": 1,
+                    "mirrored_count": 0,
+                    "scanned_count": 0,
+                    "skipped_count": 0,
+                    "failed_count": 0,
+                },
+            )()
+
+    backfill = FakeBackfill()
+
+    view = await _render_post_mirror_history_backfill_action(
+        user_id=10,
+        action="pmh:ch:-100123:all:0",
+        panel=panel,
+        post_mirror_history_backfill=backfill,
+    )
+
+    assert backfill.calls == [(None, -100123)]
+    assert "История добавлена в очередь" in view.text
+
+
+async def test_render_post_mirror_folder_history_backfill_action_enqueues_folder_history(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.set_post_mirroring_enabled(True)
+    repo.set_post_mirror_target_chat_id(-100900)
+    repo.upsert_reaction_folder(2, "Mirror folder", position=0)
+    repo.replace_reaction_folder_members(
+        2,
+        [{"chat_id": -100123, "title": "Source Channel", "kind": "channel"}],
+    )
+    repo.set_post_mirror_folder_enabled(2, True)
+    panel = ControlPanelService(owner_id=10, state=repo)
+
+    class FakeBackfill:
+        def __init__(self):
+            self.calls = []
+
+        async def enqueue_history(self, *, limit_per_source, chat_id=None, folder_id=None):
+            self.calls.append((limit_per_source, chat_id, folder_id))
+            return type(
+                "Result",
+                (),
+                {
+                    "request_queued": True,
+                    "queue_position": 1,
+                    "source_count": 1,
+                    "mirrored_count": 0,
+                    "scanned_count": 0,
+                    "skipped_count": 0,
+                    "failed_count": 0,
+                },
+            )()
+
+    backfill = FakeBackfill()
+
+    view = await _render_post_mirror_folder_history_backfill_action(
+        user_id=10,
+        action="pmh:folder:2:all",
+        panel=panel,
+        post_mirror_history_backfill=backfill,
+    )
+
+    assert backfill.calls == [(None, None, 2)]
+    assert "История добавлена в очередь" in view.text
+    assert view.action == "post_mirror.folder:2"
+
+
+def test_post_mirror_history_backfill_feedback_reports_metrics():
+    feedback = _post_mirror_history_backfill_feedback(
+        type(
+            "Result",
+            (),
+            {
+                "request_queued": False,
+                "source_count": 1,
+                "mirrored_count": 12,
+                "scanned_count": 20,
+                "skipped_count": 8,
+                "failed_count": 0,
+            },
+        )()
+    )
+
+    assert "Постов скопировано: 12" in feedback
+    assert "Просканировано: 20" in feedback
+    assert "60-120 сек" in feedback
+
+
+def test_post_mirror_history_backfill_feedback_explains_safe_background_pace():
+    feedback = _post_mirror_history_backfill_feedback(
+        type(
+            "Result",
+            (),
+            {
+                "request_queued": True,
+                "queue_position": 1,
+                "source_count": 1,
+                "mirrored_count": 0,
+                "scanned_count": 0,
+                "skipped_count": 0,
+                "failed_count": 0,
+            },
+        )()
+    )
+
+    assert "История добавлена в очередь" in feedback
+    assert "60-120 сек" in feedback
+    assert "3-6 мин" in feedback
+    assert "realtime-посты без искусственной задержки" in feedback
+
+
+async def test_render_post_mirror_source_refresh_action_syncs_catalog(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    panel = ControlPanelService(owner_id=10, state=repo)
+
+    class FakeDialog:
+        id = -100123
+        title = "Source Channel"
+        is_user = False
+        is_group = False
+        is_channel = True
+
+    class FakeClient:
+        async def iter_dialogs(self):
+            yield FakeDialog()
+
+    view = await _render_post_mirror_source_refresh_action(
+        user_id=10,
+        panel=panel,
+        state=repo,
+        chat_exporter=type("Exporter", (), {"client": FakeClient()})(),
+    )
+
+    assert repo.list_known_chats(kind="channel")[0]["chat_id"] == -100123
+    assert "Каталог обновлен" in view.text
+
+
+async def test_render_post_mirror_source_refresh_action_renames_topic_after_channel_title_change(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.set_post_mirror_target_chat_id(-100900)
+    repo.upsert_post_mirror_source(-100123, "Old Channel", "channel")
+    repo.set_post_mirror_source_topic(-100123, 77)
+    panel = ControlPanelService(owner_id=10, state=repo)
+    rename_calls = []
+
+    class FakeDialog:
+        id = -100123
+        title = "New Channel"
+        is_user = False
+        is_group = False
+        is_channel = True
+
+    class FakeClient:
+        async def iter_dialogs(self):
+            yield FakeDialog()
+
+    class FakeTopicManager:
+        def __init__(self, client):
+            self.client = client
+
+        async def rename_topic(self, target_chat_id, topic_id, title):
+            rename_calls.append((target_chat_id, topic_id, title))
+
+    view = await _render_post_mirror_source_refresh_action(
+        user_id=10,
+        panel=panel,
+        state=repo,
+        chat_exporter=type("Exporter", (), {"client": FakeClient()})(),
+        topic_manager_factory=FakeTopicManager,
+    )
+
+    assert rename_calls == [(-100900, 77, "New Channel")]
+    assert repo.get_post_mirror_source_settings(-100123).title == "New Channel"
+    assert "Каталог обновлен" in view.text
+
+
+async def test_render_post_mirror_source_add_text_validates_channel_and_creates_topic(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.set_post_mirror_target_chat_id(-100900)
+    panel = ControlPanelService(owner_id=10, state=repo)
+
+    class FakeExporter:
+        client = object()
+
+        async def get_chat(self, chat_id):
+            assert chat_id == -100123
+            return ExportChat(chat_id=-100123, title="Source Channel", kind="channel")
+
+    class FakeTopicManager:
+        def __init__(self, client):
+            self.client = client
+
+        async def create_topic(self, target_chat_id, title):
+            assert target_chat_id == -100900
+            assert title == "Source Channel"
+            return 77
+
+    view = await _render_post_mirror_source_add_text(
+        user_id=10,
+        text="-100123",
+        panel=panel,
+        state=repo,
+        chat_exporter=FakeExporter(),
+        topic_manager_factory=FakeTopicManager,
+    )
+
+    settings = repo.get_post_mirror_source_settings(-100123)
+    assert settings.enabled is True
+    assert settings.target_thread_id == 77
+    assert "Топик: 77" in view.text
+
+
+async def test_render_post_mirror_source_add_text_rejects_target_group_as_source(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.set_post_mirror_target_chat_id(-100900)
+    panel = ControlPanelService(owner_id=10, state=repo)
+
+    view = await _render_post_mirror_source_add_text(
+        user_id=10,
+        text="-100900",
+        panel=panel,
+        state=repo,
+        chat_exporter=type("Exporter", (), {"client": object()})(),
+    )
+
+    assert "Нельзя копировать группу саму в себя" in view.text
+    assert view.input_state == "post_mirror_source_add"
+    assert repo.get_post_mirror_source_settings(-100900) is None
+
+
+async def test_render_post_mirror_folder_toggle_action_enables_folder_without_creating_topics(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.set_post_mirroring_enabled(True)
+    repo.set_post_mirror_target_chat_id(-100900)
+    repo.upsert_reaction_folder(2, "Mirror folder", position=0)
+    repo.replace_reaction_folder_members(
+        2,
+        [
+            {"chat_id": -100123, "title": "News", "kind": "channel"},
+            {"chat_id": -100456, "title": "Community", "kind": "group"},
+            {"chat_id": 777, "title": "Alice", "kind": "private"},
+        ],
+    )
+    panel = ControlPanelService(owner_id=10, state=repo)
+
+    view = await _render_post_mirror_folder_toggle_action(
+        user_id=10,
+        action="pmf.toggle:2",
+        panel=panel,
+        state=repo,
+    )
+
+    folders = repo.list_post_mirror_folders()
+    assert folders[0]["enabled"] is True
+    assert repo.get_post_mirror_source_settings(-100123).enabled is True
+    assert repo.get_post_mirror_source_settings(-100123).target_thread_id is None
+    assert repo.get_post_mirror_source_settings(-100456).enabled is True
+    assert repo.get_post_mirror_source_settings(-100456).target_thread_id is None
+    assert repo.list_post_mirror_sources() == []
+    assert "Папка включена" in view.text
+    assert "Топики будут создаваться при первых постах" in view.text
 
 
 def test_reaction_history_backfill_feedback_reports_missing_targets():

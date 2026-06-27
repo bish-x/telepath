@@ -77,6 +77,7 @@ class FakeSettings:
         decoration_enabled=False,
         private_min_messages=100,
         voice_min_duration_seconds=0,
+        voice_max_duration_seconds=300,
         private_chat_overrides=None,
     ):
         self.enabled = enabled
@@ -84,6 +85,7 @@ class FakeSettings:
         self.decoration_enabled = decoration_enabled
         self.private_min_messages = private_min_messages
         self.voice_min_duration_seconds = voice_min_duration_seconds
+        self.voice_max_duration_seconds = voice_max_duration_seconds
         self.private_chat_overrides = private_chat_overrides or {}
 
     def is_feature_enabled(self, name):
@@ -100,6 +102,9 @@ class FakeSettings:
 
     def get_voice_min_duration_seconds(self):
         return self.voice_min_duration_seconds
+
+    def get_voice_max_duration_seconds(self):
+        return self.voice_max_duration_seconds
 
     def is_private_chat_transcription_enabled(self, chat_id):
         return self.private_chat_overrides.get(chat_id) is True
@@ -160,6 +165,7 @@ def make_context(
     private_chat_allowed=True,
     private_min_messages=100,
     voice_min_duration_seconds=0,
+    voice_max_duration_seconds=300,
     private_chat_overrides=None,
 ):
     return Context(
@@ -173,6 +179,7 @@ def make_context(
             decoration_enabled=decoration_enabled,
             private_min_messages=private_min_messages,
             voice_min_duration_seconds=voice_min_duration_seconds,
+            voice_max_duration_seconds=voice_max_duration_seconds,
             private_chat_overrides=private_chat_overrides,
         ),
         FakeProcessed(already_processed=already_processed),
@@ -466,6 +473,23 @@ async def test_voice_feature_skips_and_marks_processed_when_message_is_too_long(
     assert context.polisher.calls == []
     assert context.replies.sent == []
     assert context.processed.mark_processed_calls == [(100, 50, "voice_transcription")]
+
+
+async def test_voice_feature_uses_configured_maximum_duration():
+    context = make_context(voice_max_duration_seconds=420)
+    feature = VoiceTranscriptionFeature()
+
+    allowed = await feature.handle(voice_event(message_id=51, duration_seconds=301), context)
+    skipped = await feature.handle(voice_event(message_id=52, duration_seconds=421), context)
+
+    assert allowed == "voice_transcribed"
+    assert skipped == "voice_too_long"
+    assert context.transcriber.calls == [(100, 51)]
+    assert context.replies.sent == [(100, 51, "Привет, мир", False)]
+    assert context.processed.mark_processed_calls == [
+        (100, 51, "voice_transcription"),
+        (100, 52, "voice_transcription"),
+    ]
 
 
 async def test_voice_feature_allows_unknown_duration_to_fall_through_to_telegram():

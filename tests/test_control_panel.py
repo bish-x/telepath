@@ -48,6 +48,7 @@ def test_control_panel_main_and_transcription_toggle(tmp_path):
     assert "Главное меню" in main.text
     assert "Транскрибация" in button_texts(main)
     assert "Автолайк ТГК" in button_texts(main)
+    assert "Посты в топики" in button_texts(main)
     assert "Экспорт чатов" not in button_texts(main)
     assert_no_home_button(main)
 
@@ -69,6 +70,245 @@ def test_control_panel_main_and_transcription_toggle(tmp_path):
     assert not repo.is_feature_enabled("voice_transcription")
     assert "Включить" in button_texts(disabled)
     assert_bottom_back_only(disabled)
+
+
+def test_control_panel_post_mirror_overview_and_target_group_input(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    panel = ControlPanelService(owner_id=10, state=repo)
+
+    mirror = panel.handle_action(user_id=10, action="post_mirror")
+
+    assert "Посты в топики" in mirror.text
+    assert "Статус: выключена" in mirror.text
+    assert "Группа: не задана" in mirror.text
+    assert "Realtime: без искусственной задержки" in mirror.text
+    assert button_by_text(mirror, "Включить").action == "post_mirror.toggle"
+    assert button_by_text(mirror, "Группа с топиками").action == "post_mirror.target_group"
+    assert button_by_text(mirror, "Каналы").action == "post_mirror.sources"
+    assert_bottom_back_only(mirror)
+
+    prompt = panel.handle_action(user_id=10, action="post_mirror.target_group")
+    assert prompt.input_state == "post_mirror_target_group"
+    assert "chat_id группы" in prompt.text
+
+    updated = panel.handle_text(user_id=10, state="post_mirror_target_group", text="-100900")
+
+    assert repo.get_post_mirror_target_chat_id() == -100900
+    assert "Группа: -100900" in updated.text
+
+
+def test_control_panel_post_mirror_target_group_change_reports_topic_reset(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.set_post_mirror_target_chat_id(-100900)
+    repo.upsert_post_mirror_source(-100123, "Source Channel", "channel")
+    repo.set_post_mirror_source_topic(-100123, 77)
+    repo.set_post_mirror_source_enabled(-100123, True)
+    panel = ControlPanelService(owner_id=10, state=repo)
+
+    updated = panel.handle_text(user_id=10, state="post_mirror_target_group", text="-100901")
+
+    settings = repo.get_post_mirror_source_settings(-100123)
+    assert settings.enabled is False
+    assert settings.target_thread_id is None
+    assert "Топики источников сброшены" in updated.text
+
+
+def test_control_panel_post_mirror_sources_use_cached_known_channels(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.upsert_known_chat(-100123, "Source Channel", "channel", last_seen_at=30)
+    repo.upsert_known_chat(-100222, "Team Group", "group", last_seen_at=20)
+    repo.upsert_known_chat(100, "Private", "private", last_seen_at=10)
+    panel = ControlPanelService(owner_id=10, state=repo)
+
+    sources = panel.handle_action(user_id=10, action="post_mirror.sources")
+
+    assert "Каналы для копирования" in sources.text
+    texts = button_texts(sources)
+    assert "○ [КН] Source Channel" in texts
+    assert "○ [ГР] Team Group" in texts
+    assert "Private" not in sources.text
+    assert button_by_text(sources, "Найти канал").action == "post_mirror.sources.search"
+    assert button_by_text(sources, "Только включенные").action == "post_mirror.sources.enabled"
+    assert button_by_text(sources, "Ввести channel_id").action == "post_mirror.source.add"
+    assert button_by_text(sources, "Обновить каналы").action == "pm.refresh"
+    assert_bottom_back_only(sources)
+
+
+def test_control_panel_post_mirror_sources_hide_target_group_to_prevent_loops(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.set_post_mirror_target_chat_id(-100900)
+    repo.upsert_known_chat(-100900, "Target Forum", "group", last_seen_at=40)
+    repo.upsert_known_chat(-100123, "Source Channel", "channel", last_seen_at=30)
+    panel = ControlPanelService(owner_id=10, state=repo)
+
+    sources = panel.handle_action(user_id=10, action="post_mirror.sources")
+
+    texts = button_texts(sources)
+    assert "○ [КН] Source Channel" in texts
+    assert all("Target Forum" not in text for text in texts)
+
+
+def test_control_panel_post_mirror_source_detail_requires_topic_before_enable(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.upsert_known_chat(-100123, "Source Channel", "channel", last_seen_at=30)
+    repo.upsert_post_mirror_source(-100123, "Source Channel", "channel")
+    panel = ControlPanelService(owner_id=10, state=repo)
+
+    detail = panel.handle_action(user_id=10, action="post_mirror.source:-100123:0")
+
+    assert "Source Channel" in detail.text
+    assert "Топик: не задан" in detail.text
+    assert button_by_text(detail, "Создать топик").action == "pm.topic:-100123:0"
+    assert button_by_text(detail, "Ввести topic_id").action == "post_mirror.source.topic:-100123:0"
+    assert "Включить" not in button_texts(detail)
+
+
+def test_control_panel_post_mirror_source_detail_with_topic_has_toggle_and_history(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.set_post_mirroring_enabled(True)
+    repo.set_post_mirror_target_chat_id(-100900)
+    repo.upsert_known_chat(-100123, "Source Channel", "channel", last_seen_at=30)
+    repo.upsert_post_mirror_source(-100123, "Source Channel", "channel")
+    repo.set_post_mirror_source_topic(-100123, 77)
+    panel = ControlPanelService(owner_id=10, state=repo)
+
+    detail = panel.handle_action(user_id=10, action="post_mirror.source:-100123:0")
+
+    assert "Топик: 77" in detail.text
+    assert "История: 60-120 сек на пост" in detail.text
+    assert button_by_text(detail, "Включить").action == "post_mirror.source.toggle:-100123:0"
+    assert button_by_text(detail, "1000").action == "pmh:ch:-100123:1000:0"
+    assert button_by_text(detail, "Все посты").action == "pmh:ch:-100123:all:0"
+
+    enabled = panel.handle_action(user_id=10, action="post_mirror.source.toggle:-100123:0")
+    assert repo.get_post_mirror_source_settings(-100123).enabled is True
+    assert "Статус: включен" in enabled.text
+
+
+def test_control_panel_post_mirror_folder_list_and_detail(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.set_post_mirror_target_chat_id(-100900)
+    repo.upsert_reaction_folder(2, "Mirror folder", position=0)
+    repo.replace_reaction_folder_members(
+        2,
+        [
+            {"chat_id": -100123, "title": "News", "kind": "channel"},
+            {"chat_id": -100456, "title": "Community", "kind": "group"},
+        ],
+    )
+    panel = ControlPanelService(owner_id=10, state=repo)
+
+    root = panel.handle_action(user_id=10, action="post_mirror")
+
+    assert "Папки: 0/1" in root.text
+    assert button_by_text(root, "Папки").action == "post_mirror.folders"
+
+    folders = panel.handle_action(user_id=10, action="post_mirror.folders")
+
+    assert "Папки для копирования" in folders.text
+    assert "Включено: 0/1" in folders.text
+    assert "○ Mirror folder · 2 чата" in button_texts(folders)
+    assert button_by_text(folders, "Обновить папки").action == "pmf.refresh"
+
+    detail = panel.handle_action(user_id=10, action="post_mirror.folder:2")
+
+    assert "Папка: Mirror folder" in detail.text
+    assert "Чатов: 2" in detail.text
+    assert "История есть: 0/2" in detail.text
+    assert "Без истории: 2" in detail.text
+    assert "Копирование: выключено" in detail.text
+    assert button_by_text(detail, "Включить папку").action == "pmf.toggle:2"
+
+    repo.mark_processed(-100123, 1, "post_mirroring")
+    detail_with_history = panel.handle_action(user_id=10, action="post_mirror.folder:2")
+
+    assert "История есть: 1/2" in detail_with_history.text
+    assert "Без истории: 1" in detail_with_history.text
+
+    repo.set_post_mirror_folder_enabled(2, True)
+    enabled_detail = panel.handle_action(user_id=10, action="post_mirror.folder:2")
+
+    assert "Уже обработанные посты пропускаются." in enabled_detail.text
+    assert button_by_text(enabled_detail, "1000").action == "pmh:folder:2:1000"
+    assert button_by_text(enabled_detail, "5000").action == "pmh:folder:2:5000"
+    assert button_by_text(enabled_detail, "Все посты").action == "pmh:folder:2:all"
+
+
+def test_control_panel_post_mirror_source_detail_shows_folder_inheritance_without_false_disable(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.set_post_mirror_target_chat_id(-100900)
+    repo.upsert_reaction_folder(2, "Mirror folder", position=0)
+    repo.replace_reaction_folder_members(
+        2,
+        [{"chat_id": -100123, "title": "News", "kind": "channel"}],
+    )
+    repo.set_post_mirror_folder_enabled(2, True)
+    repo.upsert_post_mirror_source(-100123, "News", "channel")
+    repo.set_post_mirror_source_topic(-100123, 77)
+    panel = ControlPanelService(owner_id=10, state=repo)
+
+    detail = panel.handle_action(user_id=10, action="post_mirror.source:-100123:0")
+
+    assert "Статус: включен" in detail.text
+    assert "Источник: папка" in detail.text
+    assert "Выключить" not in button_texts(detail)
+    assert button_by_text(detail, "К папкам").action == "post_mirror.folders"
+
+
+def test_control_panel_post_mirror_rejects_non_positive_manual_topic_id(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.set_post_mirror_target_chat_id(-100900)
+    repo.upsert_known_chat(-100123, "Source Channel", "channel", last_seen_at=30)
+    repo.upsert_post_mirror_source(-100123, "Source Channel", "channel")
+    panel = ControlPanelService(owner_id=10, state=repo)
+
+    for value in ("0", "-1"):
+        view = panel.handle_text(
+            user_id=10,
+            state="post_mirror_source_topic:-100123:0",
+            text=value,
+        )
+
+        assert view.input_state == "post_mirror_source_topic:-100123:0"
+        assert "topic_id должен быть положительным числом" in view.text
+    assert repo.get_post_mirror_source_settings(-100123).target_thread_id is None
+
+
+def test_control_panel_post_mirror_source_detail_does_not_mark_topic_title_synced_before_rename(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.set_post_mirror_target_chat_id(-100900)
+    repo.upsert_post_mirror_source(-100123, "Old Channel", "channel")
+    repo.set_post_mirror_source_topic(-100123, 77)
+    repo.upsert_known_chat(-100123, "New Channel", "channel", last_seen_at=30)
+    panel = ControlPanelService(owner_id=10, state=repo)
+
+    detail = panel.handle_action(user_id=10, action="post_mirror.source:-100123:0")
+
+    assert "New Channel" in detail.text
+    assert repo.get_post_mirror_source_settings(-100123).title == "Old Channel"
+
+
+def test_control_panel_post_mirror_callback_data_stays_under_telegram_limit(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.set_post_mirror_target_chat_id(-100900)
+    repo.upsert_known_chat(-1001234567890, "Very Long Source Channel Name", "channel", last_seen_at=30)
+    repo.upsert_post_mirror_source(-1001234567890, "Very Long Source Channel Name", "channel")
+    repo.set_post_mirror_source_topic(-1001234567890, 77)
+    panel = ControlPanelService(owner_id=10, state=repo)
+
+    views = [
+        panel.handle_action(user_id=10, action="post_mirror"),
+        panel.handle_action(user_id=10, action="post_mirror.sources"),
+        panel.handle_action(user_id=10, action="post_mirror.source:-1001234567890:0"),
+    ]
+
+    actions = [
+        button.action
+        for view in views
+        for row in view.keyboard
+        for button in row
+    ]
+    assert all(len(f"panel:{action}".encode()) <= 64 for action in actions)
 
 
 def test_control_panel_main_shows_chat_export_when_enabled(tmp_path):
@@ -197,8 +437,10 @@ def test_control_panel_transcription_numeric_settings(tmp_path):
     settings = panel.handle_action(user_id=10, action="transcription.settings")
     assert "Лимит личного чата: 100 сообщений" in settings.text
     assert "ГС от: 0 сек" in settings.text
+    assert "ГС до: 300 сек" in settings.text
     assert "Лимит сообщений" in button_texts(settings)
     assert "Минимум ГС" in button_texts(settings)
+    assert "Максимум ГС" in button_texts(settings)
 
     limit_prompt = panel.handle_action(user_id=10, action="transcription.settings.private_limit")
     assert limit_prompt.input_state == "private_min_messages"
@@ -211,6 +453,12 @@ def test_control_panel_transcription_numeric_settings(tmp_path):
     duration_saved = panel.handle_text(user_id=10, state="voice_min_duration", text="12")
     assert repo.get_voice_min_duration_seconds() == 12
     assert "ГС от: 12 сек" in duration_saved.text
+
+    max_duration_prompt = panel.handle_action(user_id=10, action="transcription.settings.voice_max_duration")
+    assert max_duration_prompt.input_state == "voice_max_duration"
+    max_duration_saved = panel.handle_text(user_id=10, state="voice_max_duration", text="420")
+    assert repo.get_voice_max_duration_seconds() == 420
+    assert "ГС до: 420 сек" in max_duration_saved.text
 
 
 def test_control_panel_transcription_why_screen_is_repairable(tmp_path):

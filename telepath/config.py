@@ -46,6 +46,9 @@ class Settings:
     anthropic_timeout_seconds: int = 60
     private_history_throttle_seconds: float = 5.0
     transcription_decoration_custom_emoji_id: str | None = DEFAULT_TRANSCRIPTION_DECORATION_CUSTOM_EMOJI_ID
+    post_mirror_online_freshness_seconds: int = 180
+    post_mirror_outbox_poll_seconds: float = 30.0
+    post_mirror_delivery_delay_range_seconds: tuple[int, int] = (60, 120)
 
 
 def _require_env(name: str) -> str:
@@ -115,6 +118,12 @@ def load_settings() -> Settings:
             "TRANSCRIPTION_DECORATION_CUSTOM_EMOJI_ID",
             DEFAULT_TRANSCRIPTION_DECORATION_CUSTOM_EMOJI_ID,
         ) or None,
+        post_mirror_online_freshness_seconds=int(os.getenv("POST_MIRROR_ONLINE_FRESHNESS_SECONDS", "180")),
+        post_mirror_outbox_poll_seconds=float(os.getenv("POST_MIRROR_OUTBOX_POLL_SECONDS", "30")),
+        post_mirror_delivery_delay_range_seconds=(
+            int(os.getenv("POST_MIRROR_DELIVERY_DELAY_MIN_SECONDS", "60")),
+            int(os.getenv("POST_MIRROR_DELIVERY_DELAY_MAX_SECONDS", "120")),
+        ),
     )
 
 

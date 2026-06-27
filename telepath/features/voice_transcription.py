@@ -61,6 +61,7 @@ class SettingsPort(Protocol):
     def is_transcription_decoration_enabled(self) -> bool: ...
     def get_private_chat_min_messages(self) -> int: ...
     def get_voice_min_duration_seconds(self) -> int: ...
+    def get_voice_max_duration_seconds(self) -> int: ...
     def is_private_chat_transcription_enabled(self, chat_id: int) -> bool: ...
     def get_private_chat_transcription_override(self, chat_id: int) -> bool | None: ...
 
@@ -161,7 +162,6 @@ def remove_terminal_paragraph_periods(text: str) -> str:
 
 class VoiceTranscriptionFeature:
     name = "voice_transcription"
-    max_duration_seconds = 300
 
     def __init__(self, coordinator: TranscriptionCoordinator | None = None) -> None:
         self.coordinator = coordinator or TranscriptionCoordinator()
@@ -193,7 +193,8 @@ class VoiceTranscriptionFeature:
             return "unsupported_chat_type_skipped"
         if context.processed.is_processed(event.chat_id, event.message_id, self.name):
             return "already_processed"
-        if event.duration_seconds is not None and event.duration_seconds > self.max_duration_seconds:
+        max_duration = context.settings.get_voice_max_duration_seconds()
+        if event.duration_seconds is not None and event.duration_seconds > max_duration:
             context.processed.mark_processed(event.chat_id, event.message_id, self.name)
             return "voice_too_long"
         min_duration = context.settings.get_voice_min_duration_seconds()

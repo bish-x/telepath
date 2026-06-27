@@ -76,13 +76,16 @@ def test_repository_persists_transcription_threshold_and_min_voice_duration(tmp_
 
     assert repo.get_private_chat_min_messages() == 100
     assert repo.get_voice_min_duration_seconds() == 0
+    assert repo.get_voice_max_duration_seconds() == 300
 
     repo.set_private_chat_min_messages(250)
     repo.set_voice_min_duration_seconds(12)
+    repo.set_voice_max_duration_seconds(420)
 
     reopened = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
     assert reopened.get_private_chat_min_messages() == 250
     assert reopened.get_voice_min_duration_seconds() == 12
+    assert reopened.get_voice_max_duration_seconds() == 420
 
 
 def test_repository_rejects_invalid_transcription_numeric_settings(tmp_path):
@@ -94,6 +97,8 @@ def test_repository_rejects_invalid_transcription_numeric_settings(tmp_path):
         repo.set_private_chat_min_messages(0)
     with pytest.raises(ValueError, match="duration"):
         repo.set_voice_min_duration_seconds(-1)
+    with pytest.raises(ValueError, match="maximum duration"):
+        repo.set_voice_max_duration_seconds(0)
 
 
 def test_repository_persists_channel_reaction_settings(tmp_path):

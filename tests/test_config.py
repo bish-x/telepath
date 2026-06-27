@@ -52,6 +52,22 @@ def test_full_settings_allows_private_history_throttle_override(monkeypatch, tmp
     assert settings.private_history_throttle_seconds == 7.5
 
 
+def test_full_settings_loads_post_mirror_outbox_timing(monkeypatch, tmp_path):
+    from telepath.config import load_settings
+
+    _set_required_telegram_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("POST_MIRROR_ONLINE_FRESHNESS_SECONDS", "240")
+    monkeypatch.setenv("POST_MIRROR_OUTBOX_POLL_SECONDS", "12.5")
+    monkeypatch.setenv("POST_MIRROR_DELIVERY_DELAY_MIN_SECONDS", "10")
+    monkeypatch.setenv("POST_MIRROR_DELIVERY_DELAY_MAX_SECONDS", "20")
+
+    settings = load_settings()
+
+    assert settings.post_mirror_online_freshness_seconds == 240
+    assert settings.post_mirror_outbox_poll_seconds == 12.5
+    assert settings.post_mirror_delivery_delay_range_seconds == (10, 20)
+
+
 def test_full_settings_allows_transcription_decoration_emoji_override(monkeypatch, tmp_path):
     from telepath.config import load_settings
 

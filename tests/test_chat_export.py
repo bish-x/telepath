@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
+from zipfile import ZipFile
 
-from telepath.chat_export import TelethonChatExporter
+from telepath.chat_export import ChatMediaArchivePart, TelethonChatExporter
 
 
 class FakeDialog:
@@ -36,6 +38,9 @@ class FakeMessage:
         forwarded_from=None,
         action=None,
         views=None,
+        media=None,
+        media_name=None,
+        media_bytes=None,
     ):
         self.id = message_id
         self.message = text
@@ -53,6 +58,9 @@ class FakeMessage:
         )
         self.action = action
         self.views = views
+        self.media = media
+        self.media_name = media_name
+        self.media_bytes = media_bytes
 
 
 class FakeClient:
@@ -65,6 +73,9 @@ class FakeClient:
         self.iter_dialogs_calls = 0
         self.get_entity_calls = []
         self.iter_messages_calls = []
+        self.downloaded_paths = []
+        self.sent_files = []
+        self.requests = []
 
     async def iter_dialogs(self):
         self.iter_dialogs_calls += 1
@@ -88,6 +99,22 @@ class FakeClient:
         ]
         for message in messages:
             yield message
+
+    async def download_media(self, message, file):
+        if getattr(message, "media_bytes", None) is None:
+            return None
+        directory = Path(file)
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / (getattr(message, "media_name", None) or f"{message.id}.bin")
+        target.write_bytes(message.media_bytes)
+        self.downloaded_paths.append(target)
+        return str(target)
+
+    async def send_file(self, target_peer, path, *, caption=None):
+        self.sent_files.append((target_peer, Path(path), caption))
+
+    async def __call__(self, request):
+        self.requests.append(request)
 
 
 class SlowFakeClient(FakeClient):
@@ -146,8 +173,39 @@ class ServiceGapHistoryClient(FakeClient):
             yield message
 
 
+class MediaHistoryClient(FakeClient):
+    async def iter_messages(self, entity, *, limit=None, reverse=False, wait_time=None):
+        self.iter_messages_calls.append((entity.id, limit, reverse, wait_time))
+        messages = [
+            FakeMessage(
+                1,
+                "photo caption",
+                sender=FakeSender(1, "Alice"),
+                media=object(),
+                media_name="photo one.jpg",
+                media_bytes=b"a" * 128,
+            ),
+            FakeMessage(2, None, action=object()),
+            FakeMessage(
+                3,
+                "video caption",
+                sender=FakeSender(2, "Bish"),
+                media=object(),
+                media_name="clip.mp4",
+                media_bytes=b"b" * 128,
+            ),
+        ]
+        if reverse:
+            selected = messages if limit is None else messages[:limit]
+        else:
+            selected = list(reversed(messages)) if limit is None else list(reversed(messages))[:limit]
+        for message in selected:
+            yield message
+
+
 async def test_chat_exporter_lists_dialogs_with_pagination():
-    exporter = TelethonChatExporter(FakeClient())
+    client = FakeClient()
+    exporter = TelethonChatExporter(client)
 
     page = await exporter.list_chats(page=1, page_size=2)
 
@@ -156,6 +214,8 @@ async def test_chat_exporter_lists_dialogs_with_pagination():
     assert [(chat.chat_id, chat.title, chat.kind) for chat in page.chats] == [
         (-10030, "News", "channel")
     ]
+    assert [request.__class__.__name__ for request in client.requests] == ["UpdateStatusRequest"]
+    assert client.requests[0].offline is True
 
 
 async def test_chat_exporter_reuses_cached_dialogs_for_pagination():
@@ -215,6 +275,8 @@ async def test_chat_exporter_get_chat_uses_entity_without_warming_dialog_cache()
     assert chat.title == "Team"
     assert client.iter_dialogs_calls == 0
     assert client.get_entity_calls == [-10020]
+    assert [request.__class__.__name__ for request in client.requests] == ["UpdateStatusRequest"]
+    assert client.requests[0].offline is True
 
 
 async def test_chat_exporter_exports_text_history_as_chronological_txt():
@@ -235,6 +297,10 @@ async def test_chat_exporter_exports_text_history_as_chronological_txt():
     assert "[2026-05-27 01:02:03+00:00] #3 Bish (2) | reply_to=1" in text
     assert "[Forwarded from: Source]" in text
     assert "[Media/No text]" in text
+    assert [request.__class__.__name__ for request in client.requests] == [
+        "UpdateStatusRequest",
+        "UpdateStatusRequest",
+    ]
 
 
 async def test_chat_exporter_uses_configured_history_wait_time():
@@ -284,3 +350,144 @@ async def test_chat_exporter_serializes_parallel_exports():
     )
 
     assert client.max_active_message_iterators == 1
+
+
+async def test_chat_exporter_exports_media_archive_with_manifest_and_cleans_downloads(tmp_path):
+    client = MediaHistoryClient()
+    exporter = TelethonChatExporter(client)
+
+    parts = [
+        part
+        async for part in exporter.export_chat_media_archives(
+            -10020,
+            limit=2,
+            max_archive_bytes=1024 * 1024,
+            work_dir=tmp_path,
+        )
+    ]
+
+    assert len(parts) == 1
+    part = parts[0]
+    assert part.filename.startswith("telegram-Team--10020-")
+    assert part.filename.endswith("-part001.zip")
+    assert part.message_count == 2
+    assert part.service_message_count == 1
+    assert part.media_count == 2
+    assert part.byte_count == part.path.stat().st_size
+    with ZipFile(part.path) as archive:
+        names = archive.namelist()
+        assert "messages.txt" in names
+        assert "media/000001-photo-one.jpg" in names
+        assert "media/000003-clip.mp4" in names
+        manifest = archive.read("messages.txt").decode("utf-8")
+    assert "Telegram chat media archive" in manifest
+    assert "Messages exported: 2" in manifest
+    assert "Service messages skipped: 1" in manifest
+    assert "Media files exported: 2" in manifest
+    assert "Media: media/000001-photo-one.jpg" in manifest
+    assert "photo caption" in manifest
+    assert all(not path.exists() for path in client.downloaded_paths)
+    assert [request.__class__.__name__ for request in client.requests] == [
+        "UpdateStatusRequest",
+        "UpdateStatusRequest",
+        "UpdateStatusRequest",
+        "UpdateStatusRequest",
+    ]
+
+
+async def test_chat_exporter_splits_media_archives_by_part_budget(tmp_path):
+    client = MediaHistoryClient()
+    exporter = TelethonChatExporter(client)
+
+    parts = [
+        part
+        async for part in exporter.export_chat_media_archives(
+            -10020,
+            limit=2,
+            max_archive_bytes=760,
+            work_dir=tmp_path,
+        )
+    ]
+
+    assert [part.part_index for part in parts] == [1, 2]
+    assert [part.media_count for part in parts] == [1, 1]
+    assert [part.message_count for part in parts] == [1, 1]
+    assert all(part.byte_count <= 760 for part in parts)
+
+
+async def test_chat_exporter_sends_archive_part_via_user_client(tmp_path):
+    client = FakeClient()
+    exporter = TelethonChatExporter(client)
+    path = tmp_path / "telegram-Team--10020-20260610-010203-part001.zip"
+    path.write_bytes(b"zip")
+    part = ChatMediaArchivePart(
+        chat_id=-10020,
+        title="Team",
+        filename=path.name,
+        path=path,
+        part_index=1,
+        message_count=2,
+        service_message_count=1,
+        media_count=2,
+        byte_count=3,
+    )
+
+    await exporter.send_chat_archive_part(part, target_peer="@telepath_manager_bot")
+
+    assert client.sent_files == [
+        (
+            "@telepath_manager_bot",
+            path,
+            "Telepath archive export\n"
+            "Team\n"
+            "Часть: 001\n"
+            "Сообщений: 2\n"
+            "Сервисных событий пропущено: 1\n"
+            "Медиафайлов: 2\n"
+            "Размер: 3 B",
+        )
+    ]
+
+
+async def test_chat_exporter_removes_temp_root_when_media_archive_has_no_messages(tmp_path, monkeypatch):
+    import telepath.chat_export as chat_export_module
+
+    temp_root = tmp_path / "archive-job"
+    monkeypatch.setattr(chat_export_module.tempfile, "mkdtemp", lambda prefix: str(temp_root))
+    exporter = TelethonChatExporter(FakeClient())
+
+    parts = [
+        part
+        async for part in exporter.export_chat_media_archives(
+            -10020,
+            limit=0,
+            max_archive_bytes=1024,
+        )
+    ]
+
+    assert parts == []
+    assert not temp_root.exists()
+
+
+async def test_chat_exporter_marks_current_session_offline_after_sending_archive(tmp_path):
+    client = FakeClient()
+    exporter = TelethonChatExporter(client)
+    path = tmp_path / "archive.zip"
+    path.write_bytes(b"archive")
+    part = ChatMediaArchivePart(
+        chat_id=-10020,
+        title="Team",
+        filename="team.zip",
+        path=path,
+        part_index=1,
+        message_count=1,
+        service_message_count=0,
+        media_count=1,
+        byte_count=path.stat().st_size,
+    )
+
+    await exporter.send_chat_archive_part(part, target_peer=10)
+
+    assert len(client.sent_files) == 1
+    assert [request.__class__.__name__ for request in client.requests] == ["UpdateStatusRequest"]
+    assert client.requests[0].offline is True

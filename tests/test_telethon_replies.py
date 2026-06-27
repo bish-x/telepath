@@ -6,9 +6,13 @@ from telepath.user_client import TelethonReplies, utf16_len
 class FakeClient:
     def __init__(self):
         self.sent = []
+        self.requests = []
 
     async def send_message(self, chat_id, text, **kwargs):
         self.sent.append((chat_id, text, kwargs))
+
+    async def __call__(self, request):
+        self.requests.append(request)
 
 
 async def test_telethon_replies_wraps_transcription_with_custom_emoji_entities():
@@ -112,6 +116,16 @@ async def test_telethon_replies_falls_back_to_plain_send_when_no_entities():
     chat_id, text, kwargs = client.sent[0]
     assert text == ""
     assert kwargs == {"reply_to": 50}
+
+
+async def test_telethon_replies_marks_current_session_offline_after_send():
+    client = FakeClient()
+    replies = TelethonReplies(client, custom_emoji_id=None)
+
+    await replies.reply(chat_id=100, message_id=50, text="")
+
+    assert [request.__class__.__name__ for request in client.requests] == ["UpdateStatusRequest"]
+    assert client.requests[0].offline is True
 
 
 async def test_telethon_replies_adds_custom_emoji_when_decoration_enabled():

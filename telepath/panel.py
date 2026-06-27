@@ -56,6 +56,8 @@ class AssistantState(Protocol):
     def set_private_chat_min_messages(self, minimum_messages: int) -> None: ...
     def get_voice_min_duration_seconds(self) -> int: ...
     def set_voice_min_duration_seconds(self, seconds: int) -> None: ...
+    def get_voice_max_duration_seconds(self) -> int: ...
+    def set_voice_max_duration_seconds(self, seconds: int) -> None: ...
     def get_text_polish_prompt(self) -> str: ...
     def set_text_polish_prompt(self, prompt: str) -> None: ...
     def reset_text_polish_prompt(self) -> None: ...
@@ -63,6 +65,18 @@ class AssistantState(Protocol):
     def set_account_premium(self, is_premium: bool) -> None: ...
     def is_reaction_autolike_enabled(self) -> bool: ...
     def set_reaction_autolike_enabled(self, enabled: bool) -> None: ...
+    def is_post_mirroring_enabled(self) -> bool: ...
+    def set_post_mirroring_enabled(self, enabled: bool) -> None: ...
+    def get_post_mirror_target_chat_id(self) -> int | None: ...
+    def set_post_mirror_target_chat_id(self, chat_id: int | None) -> None: ...
+    def upsert_post_mirror_source(self, source_chat_id: int, title: str | None = None, kind: str = "channel") -> None: ...
+    def get_post_mirror_source_settings(self, source_chat_id: int): ...
+    def list_post_mirror_sources(self) -> list[dict[str, object]]: ...
+    def list_post_mirror_folders(self) -> list[dict[str, object]]: ...
+    def list_post_mirror_folder_sources(self, folder_id: int) -> list[dict[str, object]]: ...
+    def set_post_mirror_source_enabled(self, source_chat_id: int, enabled: bool) -> None: ...
+    def set_post_mirror_source_topic(self, source_chat_id: int, target_thread_id: int | None) -> None: ...
+    def set_post_mirror_folder_enabled(self, folder_id: int, enabled: bool) -> None: ...
     def get_reaction_delay_range_seconds(self) -> tuple[int, int]: ...
     def set_reaction_delay_range_seconds(self, minimum_seconds: int, maximum_seconds: int) -> None: ...
     def get_reaction_global_mode(self) -> str: ...
@@ -97,6 +111,7 @@ class ControlPanelService:
     chat_page_size = 8
     reaction_channel_page_size = 8
     reaction_emoji_page_size = 16
+    post_mirror_source_page_size = 8
 
     def __init__(
         self,
@@ -119,6 +134,8 @@ class ControlPanelService:
         self._reaction_channel_enabled_filters: dict[int, bool] = {}
         self._reaction_channel_mode_filters: dict[int, str] = {}
         self._reaction_channel_source_filters: dict[int, str] = {}
+        self._post_mirror_source_search_queries: dict[int, str] = {}
+        self._post_mirror_source_enabled_filters: dict[int, bool] = {}
 
     def main(self, *, user_id: int) -> PanelView:
         if not self._is_owner(user_id):
@@ -140,6 +157,7 @@ class ControlPanelService:
             keyboard=[
                 [PanelButton("Транскрибация", "transcription")],
                 [PanelButton("Автолайк ТГК", "reactions")],
+                [PanelButton("Посты в топики", "post_mirror")],
                 *([[PanelButton("Экспорт чатов", "export.chats")]] if self.chat_export_enabled else []),
                 [PanelButton("Статус", "status"), PanelButton("Помощь", "help")],
             ],
@@ -220,6 +238,13 @@ class ControlPanelService:
                 keyboard=self._back_keyboard(),
                 input_state="voice_min_duration",
                 action="transcription.settings.voice_min_duration",
+            )
+        if action == "transcription.settings.voice_max_duration":
+            return PanelView(
+                text="Пришли максимальную длину голосового в секундах.\n\nПример: 420",
+                keyboard=self._back_keyboard(),
+                input_state="voice_max_duration",
+                action="transcription.settings.voice_max_duration",
             )
         if action == "transcription.groups":
             return self._groups()
@@ -396,6 +421,81 @@ class ControlPanelService:
                 input_state="reaction_channel",
                 action="reactions.channel.add",
             )
+        if action == "post_mirror":
+            self._clear_post_mirror_source_filters(user_id)
+            return self._post_mirror()
+        if action == "post_mirror.toggle":
+            self.state.set_post_mirroring_enabled(not self.state.is_post_mirroring_enabled())
+            return self._post_mirror()
+        if action == "post_mirror.target_group":
+            return PanelView(
+                text="Пришли chat_id группы с топиками.\n\nПример: -1001234567890",
+                keyboard=self._back_keyboard(),
+                input_state="post_mirror_target_group",
+                action="post_mirror.target_group",
+            )
+        if action == "post_mirror.folders":
+            return self._post_mirror_folders()
+        if action == "pmf.refresh":
+            return self._post_mirror_folders()
+        if action == "post_mirror.sources":
+            return self._post_mirror_sources_for_user(user_id)
+        if action == "post_mirror.sources.enabled":
+            self._post_mirror_source_enabled_filters[user_id] = True
+            return self._post_mirror_sources_for_user(user_id)
+        if action == "post_mirror.sources.search":
+            return self._post_mirror_source_search_prompt()
+        if action == "post_mirror.source.add":
+            return PanelView(
+                text="Пришли channel_id канала.\n\nПример: -1001234567890",
+                keyboard=[[PanelButton("К списку каналов", "post_mirror.sources")], *self._back_keyboard()],
+                input_state="post_mirror_source_add",
+                action="post_mirror.source.add",
+            )
+        if action == "post_mirror.sources.search.clear":
+            self._post_mirror_source_search_queries.pop(user_id, None)
+            return self._post_mirror_sources_for_user(user_id)
+        if action.startswith("post_mirror.sources.page:"):
+            return self._post_mirror_sources_for_user(user_id, page=self._parse_page(action))
+        if action.startswith("post_mirror.sources.enabled.page:"):
+            self._post_mirror_source_enabled_filters[user_id] = True
+            return self._post_mirror_sources_for_user(user_id, page=self._parse_page(action))
+        if action.startswith("post_mirror.sources.search.page:"):
+            query = self._post_mirror_source_search_queries.get(user_id)
+            if not query:
+                return self._post_mirror_source_search_prompt()
+            return self._post_mirror_sources_for_user(user_id, page=self._parse_page(action))
+        if action.startswith("post_mirror.folder:"):
+            folder_id = self._parse_folder_id(action)
+            if folder_id is None:
+                return self._post_mirror_folders()
+            return self._post_mirror_folder_detail(folder_id)
+        if action.startswith("post_mirror.source.toggle:"):
+            return self._toggle_post_mirror_source(action)
+        if action.startswith("post_mirror.source.topic:"):
+            parsed = self._parse_post_mirror_source_action(action, "post_mirror.source.topic")
+            if parsed is None:
+                return self._post_mirror_sources_for_user(user_id)
+            source_chat_id, page = parsed
+            target_chat_id = self.state.get_post_mirror_target_chat_id()
+            if target_chat_id is not None and source_chat_id == int(target_chat_id):
+                return self._post_mirror_sources_for_user(
+                    user_id,
+                    page=page,
+                    feedback="Нельзя копировать группу саму в себя.",
+                )
+            return PanelView(
+                text="Пришли topic_id для этого канала.\n\nПример: 77",
+                keyboard=[[PanelButton("К карточке", f"post_mirror.source:{source_chat_id}:{page}")], *self._back_keyboard()],
+                input_state=f"post_mirror_source_topic:{source_chat_id}:{page}",
+                action=action,
+            )
+        if action.startswith("post_mirror.source:"):
+            parsed = self._parse_post_mirror_source_action(action, "post_mirror.source")
+            if parsed is None:
+                return self._post_mirror_sources_for_user(user_id)
+            source_chat_id, page = parsed
+            return self._post_mirror_source_detail(source_chat_id, page=page)
         return PanelView(
             text="Неизвестное действие. Возвращаю в главное меню.",
             keyboard=self._back_keyboard(),
@@ -419,16 +519,24 @@ class ControlPanelService:
             return self._handle_private_min_messages_text(text)
         if state == "voice_min_duration":
             return self._handle_voice_min_duration_text(text)
+        if state == "voice_max_duration":
+            return self._handle_voice_max_duration_text(text)
         if state == "transcription_chat_search":
             return self._handle_transcription_chat_search_text(user_id, text)
         if state == "transcription_group_search":
             return self._handle_transcription_group_search_text(user_id, text)
         if state == "reaction_channel_search":
             return self._handle_reaction_channel_search_text(user_id, text)
+        if state == "post_mirror_source_search":
+            return self._handle_post_mirror_source_search_text(user_id, text)
         if state == "reaction_channel":
             return self._handle_reaction_channel_text(text)
         if state == "reaction_delay":
             return self._handle_reaction_delay_text(text)
+        if state == "post_mirror_target_group":
+            return self._handle_post_mirror_target_group_text(text)
+        if state and state.startswith("post_mirror_source_topic:"):
+            return self._handle_post_mirror_source_topic_text(state, text)
         if text.strip().startswith("/"):
             response = self.command_service.handle_command(user_id=user_id, text=text)
             return PanelView(text=response, keyboard=self._back_keyboard(), action="main")
@@ -450,6 +558,7 @@ class ControlPanelService:
                 "Личные чаты: по лимиту или вручную",
                 f"Лимит личного чата: {self.state.get_private_chat_min_messages()} сообщений",
                 f"ГС от: {self.state.get_voice_min_duration_seconds()} сек",
+                f"ГС до: {self.state.get_voice_max_duration_seconds()} сек",
                 f"Исключения: {len(blocked)}",
                 f"Группы: выбрано {len(groups)}",
                 f"Смайлы: {decoration_status}",
@@ -726,11 +835,13 @@ class ControlPanelService:
                     "",
                     f"Лимит личного чата: {self.state.get_private_chat_min_messages()} сообщений",
                     f"ГС от: {self.state.get_voice_min_duration_seconds()} сек",
+                    f"ГС до: {self.state.get_voice_max_duration_seconds()} сек",
                 ]
             ),
             keyboard=[
                 [PanelButton("Лимит сообщений", "transcription.settings.private_limit")],
                 [PanelButton("Минимум ГС", "transcription.settings.voice_min_duration")],
+                [PanelButton("Максимум ГС", "transcription.settings.voice_max_duration")],
                 *self._back_keyboard(),
             ],
             action="transcription.settings",
@@ -932,6 +1043,442 @@ class ControlPanelService:
             if int(group["chat_id"]) == chat_id:
                 return str(group["title"])
         return str(chat_id)
+
+    def _post_mirror(self, *, feedback: str | None = None) -> PanelView:
+        enabled = self.state.is_post_mirroring_enabled()
+        target_chat_id = self.state.get_post_mirror_target_chat_id()
+        sources = self._post_mirror_source_items()
+        folders = self.state.list_post_mirror_folders()
+        enabled_count = sum(1 for source in sources if source["enabled"])
+        topic_count = sum(1 for source in sources if source["target_thread_id"] is not None)
+        enabled_folder_count = sum(1 for folder in folders if folder["enabled"])
+        lines = [
+            "Посты в топики",
+            "",
+            f"Статус: {'включена' if enabled else 'выключена'}",
+            f"Группа: {target_chat_id if target_chat_id is not None else 'не задана'}",
+            f"Источники: {enabled_count}/{len(sources)} включено",
+            f"Папки: {enabled_folder_count}/{len(folders)}",
+            f"Топики: {topic_count}/{len(sources)} настроено",
+            "Realtime: без искусственной задержки",
+            "История: 60-120 сек на пост",
+            "Новый топик: пауза 3-6 мин",
+        ]
+        if feedback:
+            lines.extend(["", feedback])
+        return PanelView(
+            text="\n".join(lines),
+            keyboard=[
+                [PanelButton("Выключить" if enabled else "Включить", "post_mirror.toggle")],
+                [PanelButton("Группа с топиками", "post_mirror.target_group")],
+                [PanelButton("Папки", "post_mirror.folders")],
+                [PanelButton("Каналы", "post_mirror.sources")],
+                *self._back_keyboard(),
+            ],
+            action="post_mirror",
+        )
+
+    def _post_mirror_sources_for_user(
+        self,
+        user_id: int,
+        *,
+        page: int = 0,
+        feedback: str | None = None,
+    ) -> PanelView:
+        return self._post_mirror_sources(
+            page=page,
+            feedback=feedback,
+            only_enabled=self._post_mirror_source_enabled_filters.get(user_id, False),
+            query=self._post_mirror_source_search_queries.get(user_id),
+        )
+
+    def _clear_post_mirror_source_filters(self, user_id: int) -> None:
+        self._post_mirror_source_search_queries.pop(user_id, None)
+        self._post_mirror_source_enabled_filters.pop(user_id, None)
+
+    def _post_mirror_folders(self, *, feedback: str | None = None) -> PanelView:
+        folders = self.state.list_post_mirror_folders()
+        enabled_count = sum(1 for folder in folders if folder["enabled"])
+        lines = [
+            "Папки для копирования",
+            "",
+            f"Включено: {enabled_count}/{len(folders)}",
+            "Топики создаются лениво при первом посте из чата.",
+        ]
+        if feedback:
+            lines.extend(["", feedback])
+        if not folders:
+            lines.extend(
+                [
+                    "",
+                    "Папки еще не синхронизированы. Нажми «Обновить папки», чтобы прочитать их из Telegram.",
+                ]
+            )
+        keyboard = [
+            [
+                PanelButton(
+                    (
+                        f"{'✅' if folder['enabled'] else '○'} "
+                        f"{self._compact_button_title(str(folder['title']))} · "
+                        f"{self._chat_count_label(int(folder['source_count']))}"
+                    ),
+                    f"post_mirror.folder:{folder['folder_id']}",
+                    style="primary" if folder["enabled"] else None,
+                )
+            ]
+            for folder in folders
+        ]
+        keyboard.append([PanelButton("Обновить папки", "pmf.refresh")])
+        keyboard.append([PanelButton("К разделу", "post_mirror")])
+        keyboard.extend(self._back_keyboard())
+        return PanelView(text="\n".join(lines), keyboard=keyboard, action="post_mirror.folders")
+
+    def _post_mirror_folder_detail(self, folder_id: int, *, feedback: str | None = None) -> PanelView:
+        folder = self._post_mirror_folder_item(folder_id)
+        if folder is None:
+            return self._post_mirror_folders(feedback="Папка не найдена. Обнови список папок.")
+        sources = self.state.list_post_mirror_folder_sources(folder_id)
+        preview = [self._compact_button_title(str(source.get("title") or source["chat_id"])) for source in sources[:5]]
+        enabled = bool(folder["enabled"])
+        source_count = int(folder["source_count"])
+        history_processed_count = int(folder.get("history_processed_count") or 0)
+        history_remaining_count = max(0, source_count - history_processed_count)
+        lines = [
+            f"Папка: {folder['title']}",
+            "",
+            f"Копирование: {'включено' if enabled else 'выключено'}",
+            f"Чатов: {source_count}",
+            f"Топиков готово: {folder['configured_count']}/{source_count}",
+            f"История есть: {history_processed_count}/{source_count}",
+            f"Без истории: {history_remaining_count}",
+            "Новые топики будут создаваться при первых постах.",
+            "История копируется последовательно: 60-120 сек на пост.",
+            "После нового топика пауза 3-6 мин.",
+            "Уже обработанные посты пропускаются.",
+        ]
+        if self.state.get_post_mirror_target_chat_id() is None:
+            lines.append("Сначала задай группу с топиками.")
+        if preview:
+            lines.extend(["", "Чаты: " + ", ".join(preview)])
+            if len(sources) > len(preview):
+                lines.append(f"Еще: {len(sources) - len(preview)}")
+        if feedback:
+            lines.extend(["", feedback])
+        keyboard = [
+            [
+                PanelButton(
+                    "Выключить папку" if enabled else "Включить папку",
+                    f"pmf.toggle:{folder_id}",
+                    style="danger" if enabled else "success",
+                )
+            ],
+            [PanelButton("Обновить папки", "pmf.refresh")],
+            [PanelButton("К папкам", "post_mirror.folders")],
+            *self._back_keyboard(),
+        ]
+        if enabled and int(folder["source_count"]) > 0:
+            keyboard.insert(
+                1,
+                [
+                    PanelButton("1000", f"pmh:folder:{folder_id}:1000"),
+                    PanelButton("5000", f"pmh:folder:{folder_id}:5000"),
+                    PanelButton("Все посты", f"pmh:folder:{folder_id}:all"),
+                ],
+            )
+        return PanelView(text="\n".join(lines), keyboard=keyboard, action=f"post_mirror.folder:{folder_id}")
+
+    def _post_mirror_folder_item(self, folder_id: int) -> dict[str, object] | None:
+        for folder in self.state.list_post_mirror_folders():
+            if int(folder["folder_id"]) == int(folder_id):
+                return folder
+        return None
+
+    def _post_mirror_source_search_prompt(self, *, error: str | None = None) -> PanelView:
+        text = "Пришли часть названия или channel_id.\n\nПример: news"
+        if error:
+            text = f"{error}\n\n{text}"
+        return PanelView(
+            text=text,
+            keyboard=[[PanelButton("К списку каналов", "post_mirror.sources")], *self._back_keyboard()],
+            input_state="post_mirror_source_search",
+            action="post_mirror.sources.search",
+        )
+
+    def _handle_post_mirror_source_search_text(self, user_id: int, text: str) -> PanelView:
+        query = self._normalize_search_query(text)
+        if query is None:
+            return self._post_mirror_source_search_prompt(error="Поиск не должен быть пустым.")
+        self._post_mirror_source_search_queries[user_id] = query
+        return self._post_mirror_sources_for_user(user_id)
+
+    def _post_mirror_sources(
+        self,
+        *,
+        page: int = 0,
+        feedback: str | None = None,
+        only_enabled: bool = False,
+        query: str | None = None,
+    ) -> PanelView:
+        all_sources = self._post_mirror_source_items()
+        enabled_count = sum(1 for source in all_sources if source["enabled"])
+        query = self._normalize_search_query(query)
+        search_mode = query is not None
+        sources = all_sources
+        if search_mode:
+            sources = [source for source in sources if self._matches_query(source, query)]
+        if only_enabled:
+            sources = [source for source in sources if source["enabled"]]
+        total_pages = max(1, (len(sources) + self.post_mirror_source_page_size - 1) // self.post_mirror_source_page_size)
+        page = min(max(page, 0), total_pages - 1)
+        page_sources = sources[page * self.post_mirror_source_page_size : (page + 1) * self.post_mirror_source_page_size]
+        lines = [
+            "Каналы для копирования",
+            "",
+            f"Включено: {enabled_count}",
+            f"Фильтр: {'только включенные' if only_enabled else 'все'}",
+        ]
+        if search_mode:
+            lines.extend([f"Поиск: {query}", f"Найдено: {len(sources)}"])
+        if not sources:
+            lines.extend(
+                [
+                    "",
+                    "Пока нет каналов под выбранные условия.",
+                    "Список пополняется из Telegram-каталога; live refresh будет отдельной кнопкой.",
+                ]
+            )
+        if feedback:
+            lines.extend(["", feedback])
+
+        keyboard = [
+            [
+                PanelButton(
+                    (
+                        f"{'✅' if source['enabled'] else '○'} "
+                        f"{self._chat_kind_prefix(str(source['kind']))} "
+                        f"{self._compact_button_title(str(source['title']))}"
+                    ),
+                    f"post_mirror.source:{source['chat_id']}:{page}",
+                    style="primary" if source["enabled"] else None,
+                )
+            ]
+            for source in page_sources
+        ]
+        if total_pages > 1:
+            prev_page = max(page - 1, 0)
+            next_page = min(page + 1, total_pages - 1)
+            if search_mode:
+                page_prefix = "post_mirror.sources.search.page"
+            elif only_enabled:
+                page_prefix = "post_mirror.sources.enabled.page"
+            else:
+                page_prefix = "post_mirror.sources.page"
+            keyboard.append(
+                [
+                    PanelButton("‹", f"{page_prefix}:{prev_page}"),
+                    PanelButton(f"{page + 1}/{total_pages}", f"{page_prefix}:{page}"),
+                    PanelButton("›", f"{page_prefix}:{next_page}"),
+                ]
+            )
+        if search_mode:
+            keyboard.append(
+                [
+                    PanelButton("Найти заново", "post_mirror.sources.search"),
+                    PanelButton("Сбросить поиск", "post_mirror.sources.search.clear"),
+                ]
+            )
+        elif only_enabled:
+            keyboard.append([PanelButton("Все каналы", "post_mirror.sources")])
+        else:
+            keyboard.append([PanelButton("Найти канал", "post_mirror.sources.search")])
+            keyboard.append([PanelButton("Только включенные", "post_mirror.sources.enabled")])
+        keyboard.append([PanelButton("Ввести channel_id", "post_mirror.source.add")])
+        keyboard.append([PanelButton("Обновить каналы", "pm.refresh")])
+        keyboard.append([PanelButton("К разделу", "post_mirror")])
+        keyboard.extend(self._back_keyboard())
+        return PanelView(text="\n".join(lines), keyboard=keyboard, action="post_mirror.sources")
+
+    def _post_mirror_source_items(self) -> list[dict[str, object]]:
+        target_chat_id = self.state.get_post_mirror_target_chat_id()
+        folder_enabled_chat_ids = self._post_mirror_folder_enabled_chat_ids()
+        configured = {
+            int(source["source_chat_id"]): source
+            for source in self.state.list_post_mirror_sources()
+            if target_chat_id is None or int(source["source_chat_id"]) != int(target_chat_id)
+        }
+        items: dict[int, dict[str, object]] = {}
+        ordered_chat_ids: list[int] = []
+        for chat in self.state.list_known_chats():
+            kind = str(chat["kind"])
+            if kind not in {"channel", "group"}:
+                continue
+            chat_id = int(chat["chat_id"])
+            if target_chat_id is not None and chat_id == int(target_chat_id):
+                continue
+            ordered_chat_ids.append(chat_id)
+            source = configured.get(chat_id)
+            settings = self.state.get_post_mirror_source_settings(chat_id)
+            direct_enabled = bool(source and source["enabled"])
+            folder_enabled = chat_id in folder_enabled_chat_ids
+            items[chat_id] = {
+                "chat_id": chat_id,
+                "title": str(chat.get("title") or chat_id),
+                "kind": kind,
+                "enabled": direct_enabled or folder_enabled,
+                "direct_enabled": direct_enabled,
+                "folder_enabled": folder_enabled,
+                "target_thread_id": settings.target_thread_id if settings else None,
+            }
+        for chat_id, source in configured.items():
+            if chat_id not in items:
+                ordered_chat_ids.append(chat_id)
+                settings = self.state.get_post_mirror_source_settings(chat_id)
+                direct_enabled = bool(source["enabled"])
+                folder_enabled = chat_id in folder_enabled_chat_ids
+                items[chat_id] = {
+                    "chat_id": chat_id,
+                    "title": str(source.get("title") or chat_id),
+                    "kind": str(source.get("kind") or "channel"),
+                    "enabled": direct_enabled or folder_enabled,
+                    "direct_enabled": direct_enabled,
+                    "folder_enabled": folder_enabled,
+                    "target_thread_id": settings.target_thread_id if settings else source["target_thread_id"],
+                }
+        return [items[chat_id] for chat_id in ordered_chat_ids]
+
+    def _post_mirror_folder_enabled_chat_ids(self) -> set[int]:
+        chat_ids: set[int] = set()
+        for folder in self.state.list_post_mirror_folders():
+            if not folder["enabled"]:
+                continue
+            for source in self.state.list_post_mirror_folder_sources(int(folder["folder_id"])):
+                chat_ids.add(int(source["chat_id"]))
+        return chat_ids
+
+    def _post_mirror_source_item(self, source_chat_id: int) -> dict[str, object] | None:
+        for source in self._post_mirror_source_items():
+            if int(source["chat_id"]) == source_chat_id:
+                return source
+        return None
+
+    def _post_mirror_source_detail(
+        self,
+        source_chat_id: int,
+        *,
+        page: int = 0,
+        feedback: str | None = None,
+    ) -> PanelView:
+        item = self._post_mirror_source_item(source_chat_id)
+        if item is None:
+            return self._post_mirror_sources(page=page, feedback="Канал не найден в локальном каталоге.")
+        settings = self.state.get_post_mirror_source_settings(source_chat_id)
+        if settings is None or settings.target_thread_id is None:
+            self.state.upsert_post_mirror_source(
+                source_chat_id,
+                str(item["title"]),
+                str(item["kind"]),
+            )
+            settings = self.state.get_post_mirror_source_settings(source_chat_id)
+        enabled = bool(settings and settings.enabled)
+        target_thread_id = settings.target_thread_id if settings else None
+        lines = [
+            str(item["title"]),
+            "",
+            f"chat_id: {source_chat_id}",
+            f"Тип: {self._chat_kind_prefix(str(item['kind']))}",
+            f"Статус: {'включен' if enabled else 'выключен'}",
+            f"Топик: {target_thread_id if target_thread_id is not None else 'не задан'}",
+            "Realtime: без искусственной задержки",
+            "История: 60-120 сек на пост",
+        ]
+        folder_enabled = bool(item.get("folder_enabled"))
+        if folder_enabled:
+            lines.append("Источник: папка")
+        if self.state.get_post_mirror_target_chat_id() is None:
+            lines.append("Сначала задай группу с топиками.")
+        if feedback:
+            lines.extend(["", feedback])
+
+        keyboard: list[list[PanelButton]] = []
+        if target_thread_id is None:
+            keyboard.append([PanelButton("Создать топик", f"pm.topic:{source_chat_id}:{page}", style="success")])
+            keyboard.append([PanelButton("Ввести topic_id", f"post_mirror.source.topic:{source_chat_id}:{page}")])
+        else:
+            if folder_enabled:
+                keyboard.append([PanelButton("К папкам", "post_mirror.folders")])
+            else:
+                keyboard.append(
+                    [
+                        PanelButton(
+                            "Выключить" if enabled else "Включить",
+                            f"post_mirror.source.toggle:{source_chat_id}:{page}",
+                            style="danger" if enabled else "success",
+                        )
+                    ]
+                )
+            keyboard.append(
+                [
+                    PanelButton("1000", f"pmh:ch:{source_chat_id}:1000:{page}"),
+                    PanelButton("5000", f"pmh:ch:{source_chat_id}:5000:{page}"),
+                    PanelButton("Все посты", f"pmh:ch:{source_chat_id}:all:{page}"),
+                ]
+            )
+            keyboard.append([PanelButton("Изменить topic_id", f"post_mirror.source.topic:{source_chat_id}:{page}")])
+        keyboard.append([PanelButton("К каналам", f"post_mirror.sources.page:{page}")])
+        keyboard.extend(self._back_keyboard())
+        return PanelView(text="\n".join(lines), keyboard=keyboard, action=f"post_mirror.source:{source_chat_id}:{page}")
+
+    def _toggle_post_mirror_source(self, action: str) -> PanelView:
+        parsed = self._parse_post_mirror_source_action(action, "post_mirror.source.toggle")
+        if parsed is None:
+            return self._post_mirror_sources()
+        source_chat_id, page = parsed
+        target_chat_id = self.state.get_post_mirror_target_chat_id()
+        if target_chat_id is not None and source_chat_id == int(target_chat_id):
+            return self._post_mirror_sources(page=page, feedback="Нельзя копировать группу саму в себя.")
+        settings = self.state.get_post_mirror_source_settings(source_chat_id)
+        if settings is None or settings.target_thread_id is None:
+            return self._post_mirror_source_detail(source_chat_id, page=page, feedback="Сначала создай или укажи топик.")
+        self.state.set_post_mirror_source_enabled(source_chat_id, not settings.enabled)
+        return self._post_mirror_source_detail(source_chat_id, page=page)
+
+    def _handle_post_mirror_target_group_text(self, text: str) -> PanelView:
+        try:
+            chat_id = int(text.strip())
+        except ValueError:
+            return PanelView(
+                text="chat_id группы должен быть числом.\n\nПример: -1001234567890",
+                keyboard=self._retry_keyboard("post_mirror.target_group"),
+                input_state="post_mirror_target_group",
+                action="post_mirror.target_group",
+            )
+        previous_chat_id = self.state.get_post_mirror_target_chat_id()
+        self.state.set_post_mirror_target_chat_id(chat_id)
+        feedback = "Группа сохранена."
+        if previous_chat_id is not None and int(previous_chat_id) != chat_id:
+            feedback += "\nТопики источников сброшены. Создай их заново в новой группе."
+        return self._post_mirror(feedback=feedback)
+
+    def _handle_post_mirror_source_topic_text(self, state: str, text: str) -> PanelView:
+        parts = state.split(":")
+        if len(parts) != 3:
+            return self._post_mirror_sources()
+        try:
+            source_chat_id = int(parts[1])
+            page = int(parts[2])
+            target_chat_id = self.state.get_post_mirror_target_chat_id()
+            if target_chat_id is not None and source_chat_id == int(target_chat_id):
+                return self._post_mirror_sources(page=page, feedback="Нельзя копировать группу саму в себя.")
+            topic_id = int(text.strip())
+            self.state.set_post_mirror_source_topic(source_chat_id, topic_id)
+        except ValueError:
+            return PanelView(
+                text="topic_id должен быть положительным числом.\n\nПример: 77",
+                keyboard=self._retry_keyboard(f"post_mirror.source.topic:{parts[1]}:{parts[2]}"),
+                input_state=state,
+                action=f"post_mirror.source.topic:{parts[1]}:{parts[2]}",
+            )
+        return self._post_mirror_source_detail(source_chat_id, page=page, feedback="Топик сохранен.")
 
     @staticmethod
     def _normalize_search_query(query: str | None) -> str | None:
@@ -2096,6 +2643,19 @@ class ControlPanelService:
             )
         return self._transcription_settings()
 
+    def _handle_voice_max_duration_text(self, text: str) -> PanelView:
+        try:
+            seconds = int(text.strip())
+            self.state.set_voice_max_duration_seconds(seconds)
+        except ValueError:
+            return PanelView(
+                text="Максимальная длина должна быть положительным числом.\n\nПример: 420",
+                keyboard=self._retry_keyboard("transcription.settings.voice_max_duration"),
+                input_state="voice_max_duration",
+                action="transcription.settings.voice_max_duration",
+            )
+        return self._transcription_settings()
+
     def _is_owner(self, user_id: int) -> bool:
         return user_id == self.owner_id
 
@@ -2138,6 +2698,16 @@ class ControlPanelService:
             return None
 
     @staticmethod
+    def _parse_post_mirror_source_action(action: str, prefix: str) -> tuple[int, int] | None:
+        parts = action.split(":")
+        if len(parts) != 3 or parts[0] != prefix:
+            return None
+        try:
+            return int(parts[1]), int(parts[2])
+        except ValueError:
+            return None
+
+    @staticmethod
     def _parse_folder_id(action: str) -> int | None:
         parts = action.split(":")
         if len(parts) < 2:
@@ -2152,6 +2722,7 @@ class ControlPanelService:
         return {
             "private": "[ЛС]",
             "group": "[ГР]",
+            "channel": "[КН]",
             "chat": "[ЧАТ]",
         }.get(kind, "[ЧАТ]")
 
@@ -2201,6 +2772,16 @@ class ControlPanelService:
             noun = "канала"
         else:
             noun = "каналов"
+        return f"{count} {noun}"
+
+    @staticmethod
+    def _chat_count_label(count: int) -> str:
+        if count % 10 == 1 and count % 100 != 11:
+            noun = "чат"
+        elif count % 10 in {2, 3, 4} and count % 100 not in {12, 13, 14}:
+            noun = "чата"
+        else:
+            noun = "чатов"
         return f"{count} {noun}"
 
     @staticmethod

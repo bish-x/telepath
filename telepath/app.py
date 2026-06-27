@@ -9,7 +9,7 @@ from telepath.chat_export import TelethonChatExporter
 from telepath.config import load_settings
 from telepath.manager_bot import run_manager_bot
 from telepath.session_paths import ensure_session_parent
-from telepath.user_client import ChannelReactionHistoryBackfill, run_user_client
+from telepath.user_client import ChannelReactionHistoryBackfill, PostMirrorHistoryBackfill, run_user_client
 
 
 def build_telegram_client(settings: Any) -> Any:  # pragma: no cover - integration only
@@ -24,12 +24,14 @@ async def run() -> None:
     telegram_client = build_telegram_client(settings)
     chat_exporter = TelethonChatExporter(telegram_client)
     reaction_history_backfill = ChannelReactionHistoryBackfill()
+    post_mirror_history_backfill = PostMirrorHistoryBackfill()
     tasks = [
         asyncio.create_task(
             run_user_client(
                 settings,
                 client=telegram_client,
                 reaction_history_backfill=reaction_history_backfill,
+                post_mirror_history_backfill=post_mirror_history_backfill,
             )
         ),
         asyncio.create_task(
@@ -37,6 +39,7 @@ async def run() -> None:
                 settings,
                 chat_exporter=chat_exporter,
                 reaction_history_backfill=reaction_history_backfill,
+                post_mirror_history_backfill=post_mirror_history_backfill,
             )
         ),
     ]

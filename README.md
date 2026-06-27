@@ -26,8 +26,14 @@ scope.
 - **Channel autolike** from your Telegram account with per-channel settings,
   folder defaults, randomized reactions, Telegram Premium-aware reaction count,
   fallback handling, and delayed sending.
+- **Post mirroring into forum topics**: selected channels or groups are copied
+  into topics of one owner-selected forum group, including media and albums,
+  without relying on Telegram forward metadata. Source posts are first persisted
+  into a local SQLite outbox; topic delivery is attempted only while another
+  Telegram client session for the owner account is recently active.
 - **Local state** in SQLite: processed messages, allowlists, channel reaction
-  settings, cached Telegram folders, available reactions, and chat metadata.
+  settings, post-mirroring rules, cached Telegram folders, available reactions,
+  and chat metadata.
 
 ## How It Works
 
@@ -111,6 +117,7 @@ Main areas:
   - global on/off switch
   - personal chat and group scopes
   - minimum voice duration
+  - maximum voice duration
   - private-chat message threshold
   - prompt editing
   - diagnostics explaining why a message was skipped
@@ -156,7 +163,7 @@ Telepath is conservative by default:
 - groups are processed only when explicitly selected
 - channels are skipped by voice transcription
 - personal-chat exceptions are skipped
-- voice/video notes longer than 5 minutes are skipped
+- voice/video notes longer than the configured maximum duration are skipped
 - voice/video notes shorter than the configured minimum duration are skipped
 - Telegram transcription failures and empty transcripts are skipped silently and
   marked processed
@@ -202,16 +209,59 @@ History processing:
 - batch sizes: 1000, 2000, 5000, or full history
 - albums are handled as one logical post to avoid duplicate reactions
 - jobs are queued so repeated clicks do not run overlapping history scans
-- completion is sent as a separate bot message with metrics
+  - completion is sent as a separate bot message with metrics
+- **Posts to topics**
+  - one target Telegram group with topics enabled
+  - per-source channel/group topic mapping
+  - topic creation from the manager panel when adding a source
+  - realtime copy with no artificial delay
+  - history backfill for old posts
+  - albums copied as one logical post
+  - idempotency so realtime and history do not duplicate copied posts
 
 ## Chat Export
 
-The manager bot can export readable chat history as a `.txt` document. Exports
-are owner-triggered, not automatic.
+The manager bot can export readable chat history as a `.txt` document or a
+media `.zip` archive. Exports are owner-triggered, not automatic.
 
 The picker supports search and paging. Large exports require explicit
 confirmation so a mistaken button press does not start a long Telegram history
 scan.
+
+Text exports are sent by the manager bot as small `.txt` documents. Media
+archives are created and uploaded by the Telegram user account into the private
+chat with the manager bot, so large parts do not go through cloud Bot API upload
+limits. Non-Premium accounts use archive parts up to about 1.5 GB; Premium
+accounts use parts up to about 3.5 GB.
+
+Media export is streamed through temporary files: downloaded source media is
+packed into the current zip part and removed, each completed zip part is sent,
+then that zip file is removed from the server. While one part is uploading, the
+next part can continue forming.
+
+## Posts To Topics
+
+Telepath can copy posts from selected Telegram channels or groups into topics
+inside one configured Telegram forum group. Each source gets its own topic. If a
+source is added from the manager panel and no topic is configured yet, Telepath
+creates the topic through the Telegram user account, stores the topic root
+message id, and enables that source.
+
+New posts are accepted into the mirror outbox in realtime without the autolike
+delay. During gated delivery, protected-source cases are handled by copying
+content as new messages: Telepath downloads media to a temporary directory,
+sends the text/media/album to the configured topic, then removes the temporary
+files. History backfill uses the same outbox and copy path, so it can safely
+coexist with realtime mirroring.
+
+Delivery is gated to avoid the assistant making the owner account look online:
+realtime and history workers accept posts into the local SQLite outbox, while a
+separate sender drains that outbox only when a non-current Telegram
+authorization for the same account was active recently. The current Telepath
+session never counts as owner activity. Missing topics are created by that
+sender after the gate opens, and queued deliveries are paced by
+`POST_MIRROR_DELIVERY_DELAY_MIN_SECONDS` /
+`POST_MIRROR_DELIVERY_DELAY_MAX_SECONDS` instead of being burst-sent.
 
 ## Running Without Docker
 

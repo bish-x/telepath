@@ -27,6 +27,7 @@ class FakeClient:
         self.error = error
         self.handlers = []
         self.removed = []
+        self.requests = []
 
     async def get_input_entity(self, chat_id):
         return f"peer:{chat_id}"
@@ -38,6 +39,9 @@ class FakeClient:
         self.removed.append((handler, event))
 
     async def __call__(self, request):
+        self.requests.append(request)
+        if request.__class__.__name__ == "UpdateStatusRequest":
+            return None
         if self.error:
             raise self.error
         if self.update is not None:
@@ -57,6 +61,9 @@ class FakeClientSequence(FakeClient):
         self.call_count = 0
 
     async def __call__(self, request):
+        self.requests.append(request)
+        if request.__class__.__name__ == "UpdateStatusRequest":
+            return None
         result = self.results[min(self.call_count, len(self.results) - 1)]
         self.call_count += 1
         return result
@@ -68,6 +75,21 @@ async def test_transcriber_returns_immediate_text_without_waiting_for_update():
 
     assert await transcriber.transcribe(chat_id=100, message_id=50) == "готово"
     assert client.removed
+
+
+async def test_transcriber_marks_current_session_offline_after_transcribe_request():
+    client = FakeClient(TranscribeResult(text="готово"))
+    transcriber = TelethonTranscriber(client, update_timeout_seconds=0.01)
+
+    assert await transcriber.transcribe(chat_id=100, message_id=50) == "готово"
+
+    assert [request.__class__.__name__ for request in client.requests] == [
+        "UpdateStatusRequest",
+        "TranscribeAudioRequest",
+        "UpdateStatusRequest",
+    ]
+    assert client.requests[0].offline is True
+    assert client.requests[2].offline is True
 
 
 async def test_transcriber_waits_for_pending_update_by_transcription_id():
@@ -171,6 +193,7 @@ class FakeClientWithEarlyUpdate:
         self.result = TranscribeResult(text="", pending=True, transcription_id=target_transcription_id)
         self.handlers = []
         self.removed = []
+        self.requests = []
         self.target_msg_id = target_msg_id
         self.target_transcription_id = target_transcription_id
 
@@ -184,6 +207,9 @@ class FakeClientWithEarlyUpdate:
         self.removed.append((handler, event))
 
     async def __call__(self, request):
+        self.requests.append(request)
+        if request.__class__.__name__ == "UpdateStatusRequest":
+            return None
         # Emit an unrelated update + the target update BEFORE returning.
         unrelated = types.UpdateTranscribedAudio(
             peer=types.PeerUser(user_id=7),
