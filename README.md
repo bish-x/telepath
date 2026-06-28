@@ -261,7 +261,11 @@ authorization for the same account was active recently. The current Telepath
 session never counts as owner activity. Missing topics are created by that
 sender after the gate opens, and queued deliveries are paced by
 `POST_MIRROR_DELIVERY_DELAY_MIN_SECONDS` /
-`POST_MIRROR_DELIVERY_DELAY_MAX_SECONDS` instead of being burst-sent.
+`POST_MIRROR_DELIVERY_DELAY_MAX_SECONDS` instead of being burst-sent. Each
+drain normally aims to clear ready posts within about two minutes; larger
+backlogs can use up to `POST_MIRROR_ONLINE_DELIVERY_WINDOW_SECONDS` so delivery
+keeps spacing between posts without stretching the online session indefinitely.
+The Telepath session is marked offline again after each drain attempt.
 
 ## Running Without Docker
 

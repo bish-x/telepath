@@ -49,6 +49,7 @@ class Settings:
     post_mirror_online_freshness_seconds: int = 180
     post_mirror_outbox_poll_seconds: float = 30.0
     post_mirror_delivery_delay_range_seconds: tuple[int, int] = (60, 120)
+    post_mirror_online_delivery_window_seconds: int = 300
 
 
 def _require_env(name: str) -> str:
@@ -123,6 +124,9 @@ def load_settings() -> Settings:
         post_mirror_delivery_delay_range_seconds=(
             int(os.getenv("POST_MIRROR_DELIVERY_DELAY_MIN_SECONDS", "60")),
             int(os.getenv("POST_MIRROR_DELIVERY_DELAY_MAX_SECONDS", "120")),
+        ),
+        post_mirror_online_delivery_window_seconds=int(
+            os.getenv("POST_MIRROR_ONLINE_DELIVERY_WINDOW_SECONDS", "300")
         ),
     )
 

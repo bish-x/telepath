@@ -1653,7 +1653,12 @@ class OnlineGatedForumTopicManager:
 
 POST_MIRROR_OUTBOX_DELIVERY_POLL_SECONDS = 30.0
 POST_MIRROR_OUTBOX_DELIVERY_DELAY_RANGE_SECONDS = (60, 120)
+POST_MIRROR_OUTBOX_PREFERRED_DELIVERY_WINDOW_SECONDS = 120
+POST_MIRROR_OUTBOX_ONLINE_DELIVERY_WINDOW_SECONDS = 300
+POST_MIRROR_OUTBOX_SPAM_SAFE_SPACING_SECONDS = 5.0
+POST_MIRROR_OUTBOX_DELIVERY_BATCH_SIZE = 1000
 POST_MIRROR_OUTBOX_RETRY_DELAY_SECONDS = 300
+POST_MIRROR_OUTBOX_PERMANENT_FAILURE_ATTEMPTS = 5
 
 
 class PostMirrorOutboxDeliveryWorker:
@@ -1667,8 +1672,10 @@ class PostMirrorOutboxDeliveryWorker:
         post_mirror_topic_manager: Any | None = None,
         poll_seconds: float = POST_MIRROR_OUTBOX_DELIVERY_POLL_SECONDS,
         delivery_delay_range_seconds: tuple[int, int] = POST_MIRROR_OUTBOX_DELIVERY_DELAY_RANGE_SECONDS,
+        online_delivery_window_seconds: int = POST_MIRROR_OUTBOX_ONLINE_DELIVERY_WINDOW_SECONDS,
         randint: Callable[[int, int], int] = random.randint,
         sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
         now: Callable[[], int] | None = None,
         logger_: logging.Logger | None = None,
     ) -> None:
@@ -1679,8 +1686,10 @@ class PostMirrorOutboxDeliveryWorker:
         self._post_mirror_topic_manager = post_mirror_topic_manager
         self._poll_seconds = max(0.1, float(poll_seconds))
         self._delivery_delay_range_seconds = self._normalize_delay_range(delivery_delay_range_seconds)
+        self._online_delivery_window_seconds = max(1, int(online_delivery_window_seconds))
         self._randint = randint
         self._sleep = sleep
+        self._monotonic = monotonic
         self._now = now or (lambda: int(time.time()))
         self._logger = logger_ or logger
 
@@ -1689,19 +1698,39 @@ class PostMirrorOutboxDeliveryWorker:
             await self.drain_once()
             await self._sleep(self._poll_seconds)
 
-    async def drain_once(self, *, limit: int = 10) -> int:
-        if not await self._online_gate.is_online():
-            self._logger.info("post_mirror_outbox_waiting_for_owner_online")
-            return 0
-        jobs = self._state.list_ready_post_mirror_deliveries(now=self._now(), limit=limit)
+    async def drain_once(self, *, limit: int | None = None) -> int:
+        started_at = self._monotonic()
         sent_count = 0
-        for job in jobs:
-            if sent_count > 0:
-                await self._sleep_between_deliveries()
-            delivered = await self._deliver_job(job)
-            if delivered:
-                sent_count += 1
-        return sent_count
+        remaining_limit = None if limit is None else max(0, int(limit))
+        try:
+            if not await self._online_gate.is_online():
+                self._logger.info("post_mirror_outbox_waiting_for_owner_online")
+                return 0
+            while remaining_limit is None or remaining_limit > 0:
+                batch_limit = POST_MIRROR_OUTBOX_DELIVERY_BATCH_SIZE
+                if remaining_limit is not None:
+                    batch_limit = min(batch_limit, remaining_limit)
+                jobs = self._state.list_ready_post_mirror_deliveries(now=self._now(), limit=batch_limit)
+                if not jobs:
+                    break
+                for index, job in enumerate(jobs):
+                    if sent_count > 0:
+                        await self._sleep_between_deliveries(
+                            started_at=started_at,
+                            remaining_sleep_count=len(jobs) - index,
+                        )
+                    delivered = await self._deliver_job(job)
+                    if delivered:
+                        sent_count += 1
+                    if remaining_limit is not None:
+                        remaining_limit -= 1
+                        if remaining_limit <= 0:
+                            break
+                if len(jobs) < batch_limit:
+                    break
+            return sent_count
+        finally:
+            await mark_current_session_offline(self._client, logger_=self._logger)
 
     async def _deliver_job(self, job: PostMirrorQueuedDelivery) -> bool:
         try:
@@ -1710,12 +1739,23 @@ class PostMirrorOutboxDeliveryWorker:
                 return False
             messages = await self._load_messages(job)
             if not messages:
-                self._state.defer_post_mirror_delivery(
-                    job.id,
-                    delay_seconds=POST_MIRROR_OUTBOX_RETRY_DELAY_SECONDS,
-                    error="source messages unavailable",
-                    now=self._now(),
-                )
+                if job.attempts >= POST_MIRROR_OUTBOX_PERMANENT_FAILURE_ATTEMPTS:
+                    self._state.cancel_post_mirror_delivery(
+                        job.id,
+                        error="source messages unavailable after repeated attempts",
+                    )
+                    self._logger.warning(
+                        "post_mirror_outbox_cancelled_permanent job_id=%s error=%s",
+                        job.id,
+                        "source messages unavailable",
+                    )
+                else:
+                    self._state.defer_post_mirror_delivery(
+                        job.id,
+                        delay_seconds=POST_MIRROR_OUTBOX_RETRY_DELAY_SECONDS,
+                        error="source messages unavailable",
+                        now=self._now(),
+                    )
                 return False
             target_thread_id = await self._resolve_target_thread_id(job)
             if target_thread_id is None:
@@ -1768,14 +1808,27 @@ class PostMirrorOutboxDeliveryWorker:
             self._logger.warning("post_mirror_outbox_flood_wait job_id=%s wait_seconds=%s", job.id, wait_seconds)
             return False
         except Exception as exc:
-            self._state.defer_post_mirror_delivery(
-                job.id,
-                delay_seconds=POST_MIRROR_OUTBOX_RETRY_DELAY_SECONDS,
-                error=str(exc)[:500],
-                now=self._now(),
-            )
-            self._logger.exception("post_mirror_outbox_delivery_failed job_id=%s", job.id)
+            error = str(exc)[:500]
+            if self._is_permanent_delivery_error(exc):
+                self._state.cancel_post_mirror_delivery(job.id, error=error)
+                self._logger.warning(
+                    "post_mirror_outbox_cancelled_permanent job_id=%s error=%s",
+                    job.id,
+                    error,
+                )
+            else:
+                self._state.defer_post_mirror_delivery(
+                    job.id,
+                    delay_seconds=POST_MIRROR_OUTBOX_RETRY_DELAY_SECONDS,
+                    error=error,
+                    now=self._now(),
+                )
+                self._logger.exception("post_mirror_outbox_delivery_failed job_id=%s", job.id)
             return False
+
+    @staticmethod
+    def _is_permanent_delivery_error(exc: Exception) -> bool:
+        return isinstance(exc, TypeError) and "MessageMediaPaidMedia" in str(exc)
 
     def _delivery_still_allowed(self, job: PostMirrorQueuedDelivery) -> bool:
         if not self._state.is_post_mirroring_enabled():
@@ -1816,11 +1869,41 @@ class PostMirrorOutboxDeliveryWorker:
         self._state.set_post_mirror_source_topic(job.source_chat_id, int(topic_id))
         return int(topic_id)
 
-    async def _sleep_between_deliveries(self) -> None:
+    async def _sleep_between_deliveries(
+        self,
+        *,
+        started_at: float | None = None,
+        remaining_sleep_count: int = 1,
+    ) -> None:
         minimum, maximum = self._delivery_delay_range_seconds
         if maximum <= 0:
             return
-        await self._sleep(self._randint(minimum, maximum))
+        delay_seconds = self._randint(minimum, maximum)
+        if started_at is not None:
+            elapsed_seconds = max(0.0, self._monotonic() - started_at)
+            sleep_count = max(1, int(remaining_sleep_count))
+            preferred_remaining_seconds = max(
+                0.0,
+                POST_MIRROR_OUTBOX_PREFERRED_DELIVERY_WINDOW_SECONDS - elapsed_seconds,
+            )
+            online_remaining_seconds = max(0.0, self._online_delivery_window_seconds - elapsed_seconds)
+            preferred_delay_seconds = preferred_remaining_seconds / sleep_count
+            online_delay_seconds = online_remaining_seconds / sleep_count
+            if preferred_delay_seconds >= POST_MIRROR_OUTBOX_SPAM_SAFE_SPACING_SECONDS:
+                budgeted_delay_seconds = preferred_delay_seconds
+            else:
+                budgeted_delay_seconds = online_delay_seconds
+            if delay_seconds > budgeted_delay_seconds:
+                self._logger.info(
+                    "post_mirror_outbox_delivery_delay_capped elapsed_seconds=%s requested_delay_seconds=%s capped_delay_seconds=%s",
+                    round(elapsed_seconds, 3),
+                    delay_seconds,
+                    round(budgeted_delay_seconds, 3),
+                )
+                delay_seconds = budgeted_delay_seconds
+        if delay_seconds <= 0:
+            return
+        await self._sleep(delay_seconds)
 
     @staticmethod
     def _normalize_delay_range(delay_range: tuple[int, int]) -> tuple[int, int]:
@@ -4079,6 +4162,7 @@ async def run_user_client(
         post_mirror_topic_manager=post_mirror_topic_manager,
         poll_seconds=settings.post_mirror_outbox_poll_seconds,
         delivery_delay_range_seconds=settings.post_mirror_delivery_delay_range_seconds,
+        online_delivery_window_seconds=settings.post_mirror_online_delivery_window_seconds,
     )
     if reaction_history_backfill is not None:
         reaction_history_backfill.bind(
