@@ -49,7 +49,7 @@ from telepath.features.voice_transcription import (
     VoiceTranscriptionFeature,
 )
 from telepath.llm import build_polisher
-from telepath.presence import mark_current_session_offline
+from telepath.presence import mark_current_session_offline, suppress_current_session_offline_updates
 from telepath.profanity import find_profanity_spans
 from telepath.runtime import AssistantContext
 from telepath.session_paths import ensure_session_parent
@@ -1601,9 +1601,8 @@ class TelegramAuthorizationOnlineGate:
             result = await self._client(functions.account.GetAuthorizationsRequest())
         except Exception:
             logger.exception("post_mirror_online_gate_check_failed")
-            return False
-        finally:
             await mark_current_session_offline(self._client)
+            return False
         now = self._normalize_datetime(self._now())
         for authorization in getattr(result, "authorizations", None) or []:
             if getattr(authorization, "current", False):
@@ -1614,6 +1613,7 @@ class TelegramAuthorizationOnlineGate:
             active_at = self._normalize_datetime(active_at)
             if (now - active_at).total_seconds() <= self._freshness_seconds:
                 return True
+        await mark_current_session_offline(self._client)
         return False
 
     @staticmethod
@@ -1638,7 +1638,8 @@ class OnlineGatedForumTopicManager:
     async def create_topic(self, target_chat_id: int, title: str) -> int:
         if not await self._online_gate.is_online():
             raise RuntimeError("owner is offline; topic creation is deferred")
-        return await self._topic_manager.create_topic(target_chat_id, title)
+        with suppress_current_session_offline_updates():
+            return await self._topic_manager.create_topic(target_chat_id, title)
 
     async def rename_topic(self, target_chat_id: int, topic_id: int, title: str) -> None:
         if not await self._online_gate.is_online():
@@ -1648,7 +1649,8 @@ class OnlineGatedForumTopicManager:
                 topic_id,
             )
             return
-        await self._topic_manager.rename_topic(target_chat_id, topic_id, title)
+        with suppress_current_session_offline_updates():
+            await self._topic_manager.rename_topic(target_chat_id, topic_id, title)
 
 
 POST_MIRROR_OUTBOX_DELIVERY_POLL_SECONDS = 30.0
@@ -1702,35 +1704,36 @@ class PostMirrorOutboxDeliveryWorker:
         started_at = self._monotonic()
         sent_count = 0
         remaining_limit = None if limit is None else max(0, int(limit))
-        try:
+        while remaining_limit is None or remaining_limit > 0:
+            batch_limit = POST_MIRROR_OUTBOX_DELIVERY_BATCH_SIZE
+            if remaining_limit is not None:
+                batch_limit = min(batch_limit, remaining_limit)
+            jobs = self._state.list_ready_post_mirror_deliveries(now=self._now(), limit=batch_limit)
+            if not jobs:
+                break
             if not await self._online_gate.is_online():
                 self._logger.info("post_mirror_outbox_waiting_for_owner_online")
-                return 0
-            while remaining_limit is None or remaining_limit > 0:
-                batch_limit = POST_MIRROR_OUTBOX_DELIVERY_BATCH_SIZE
-                if remaining_limit is not None:
-                    batch_limit = min(batch_limit, remaining_limit)
-                jobs = self._state.list_ready_post_mirror_deliveries(now=self._now(), limit=batch_limit)
-                if not jobs:
-                    break
-                for index, job in enumerate(jobs):
-                    if sent_count > 0:
-                        await self._sleep_between_deliveries(
-                            started_at=started_at,
-                            remaining_sleep_count=len(jobs) - index,
-                        )
+                break
+            for index, job in enumerate(jobs):
+                if sent_count > 0:
+                    await self._sleep_between_deliveries(
+                        started_at=started_at,
+                        remaining_sleep_count=len(jobs) - index,
+                    )
+                    if not await self._online_gate.is_online():
+                        self._logger.info("post_mirror_outbox_owner_went_offline")
+                        return sent_count
+                with suppress_current_session_offline_updates():
                     delivered = await self._deliver_job(job)
-                    if delivered:
-                        sent_count += 1
-                    if remaining_limit is not None:
-                        remaining_limit -= 1
-                        if remaining_limit <= 0:
-                            break
-                if len(jobs) < batch_limit:
-                    break
-            return sent_count
-        finally:
-            await mark_current_session_offline(self._client, logger_=self._logger)
+                if delivered:
+                    sent_count += 1
+                if remaining_limit is not None:
+                    remaining_limit -= 1
+                    if remaining_limit <= 0:
+                        break
+            if len(jobs) < batch_limit:
+                break
+        return sent_count
 
     async def _deliver_job(self, job: PostMirrorQueuedDelivery) -> bool:
         try:

@@ -2637,7 +2637,11 @@ async def test_telegram_authorization_online_gate_ignores_current_session():
     now = datetime(2026, 6, 26, 12, 0, tzinfo=timezone.utc)
 
     class FakeClient:
+        def __init__(self):
+            self.requests = []
+
         async def __call__(self, request):
+            self.requests.append(request)
             return SimpleNamespace(
                 authorizations=[
                     SimpleNamespace(current=True, date_active=now),
@@ -2645,17 +2649,54 @@ async def test_telegram_authorization_online_gate_ignores_current_session():
                 ]
             )
 
-    gate = TelegramAuthorizationOnlineGate(FakeClient(), freshness_seconds=60, now=lambda: now)
+    client = FakeClient()
+    gate = TelegramAuthorizationOnlineGate(client, freshness_seconds=60, now=lambda: now)
 
     assert await gate.is_online() is True
+    assert [request.__class__.__name__ for request in client.requests] == ["GetAuthorizationsRequest"]
 
     class CurrentOnlyClient:
+        def __init__(self):
+            self.requests = []
+
         async def __call__(self, request):
+            self.requests.append(request)
             return SimpleNamespace(authorizations=[SimpleNamespace(current=True, date_active=now)])
 
-    current_only_gate = TelegramAuthorizationOnlineGate(CurrentOnlyClient(), freshness_seconds=60, now=lambda: now)
+    current_only_client = CurrentOnlyClient()
+    current_only_gate = TelegramAuthorizationOnlineGate(current_only_client, freshness_seconds=60, now=lambda: now)
 
     assert await current_only_gate.is_online() is False
+    assert [request.__class__.__name__ for request in current_only_client.requests] == [
+        "GetAuthorizationsRequest",
+        "UpdateStatusRequest",
+    ]
+
+
+async def test_post_mirror_outbox_delivery_worker_skips_online_gate_when_no_ready_jobs(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+
+    class ExplodingGate:
+        async def is_online(self):
+            raise AssertionError("empty outbox must not poll Telegram authorizations")
+
+    class FakeClient:
+        async def __call__(self, request):
+            raise AssertionError("empty outbox must not update Telegram status")
+
+    class FailingSender:
+        async def copy_post(self, event, *, target_chat_id, target_thread_id):
+            raise AssertionError("empty outbox must not send")
+
+    worker = PostMirrorOutboxDeliveryWorker(
+        state=repo,
+        client=FakeClient(),
+        post_mirror_sender=FailingSender(),
+        online_gate=ExplodingGate(),
+        now=lambda: 1000,
+    )
+
+    assert await worker.drain_once(limit=10) == 0
 
 
 async def test_post_mirror_outbox_delivery_worker_skips_sends_while_offline(tmp_path):
@@ -2820,6 +2861,40 @@ async def test_online_gated_topic_manager_skips_rename_while_offline():
     await gated.rename_topic(-100900, 77, "New Title")
 
     assert topic_manager.renames == []
+
+
+async def test_online_gated_topic_manager_does_not_force_offline_after_online_gate():
+    from telepath.presence import mark_current_session_offline
+
+    requests = []
+
+    class FakeClient:
+        async def __call__(self, request):
+            requests.append(request)
+
+    class OnlineGate:
+        async def is_online(self):
+            return True
+
+    class TopicManager:
+        def __init__(self, client):
+            self.client = client
+
+        async def create_topic(self, target_chat_id, title):
+            await mark_current_session_offline(self.client)
+            return 77
+
+        async def rename_topic(self, target_chat_id, topic_id, title):
+            await mark_current_session_offline(self.client)
+
+    client = FakeClient()
+    topic_manager = TopicManager(client)
+    gated = OnlineGatedForumTopicManager(topic_manager, OnlineGate())
+
+    assert await gated.create_topic(-100900, "Source") == 77
+    await gated.rename_topic(-100900, 77, "Renamed")
+
+    assert requests == []
 
 
 async def test_post_mirror_outbox_delivery_worker_cancels_disabled_source_without_sending(tmp_path):
@@ -3005,6 +3080,61 @@ async def test_post_mirror_outbox_delivery_worker_paces_actual_sends(tmp_path):
 
     assert await worker.drain_once(limit=10) == 2
     assert sleeps == [6]
+
+
+async def test_post_mirror_outbox_delivery_worker_stops_when_owner_goes_offline_mid_drain(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.set_post_mirroring_enabled(True)
+    repo.set_post_mirror_target_chat_id(-100900)
+    repo.upsert_post_mirror_source(-100111, "Source Channel", "channel")
+    repo.set_post_mirror_source_enabled(-100111, True)
+    repo.set_post_mirror_source_topic(-100111, 77)
+    for message_id in (10, 11):
+        repo.enqueue_post_mirror_delivery(
+            source_chat_id=-100111,
+            message_ids=(message_id,),
+            is_channel=True,
+            is_group=False,
+            grouped_id=None,
+            target_chat_id=-100900,
+            target_thread_id=77,
+            origin="realtime",
+            ready_at=1000,
+        )
+    sleeps = []
+
+    class OnlineThenOfflineGate:
+        def __init__(self):
+            self.calls = 0
+
+        async def is_online(self):
+            self.calls += 1
+            return self.calls == 1
+
+    class FakeClient:
+        async def get_messages(self, chat_id, *, ids):
+            return [FakeHistoryMessage(ids[0])]
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    gate = OnlineThenOfflineGate()
+    sender = FakePostMirrorSender()
+    worker = PostMirrorOutboxDeliveryWorker(
+        state=repo,
+        client=FakeClient(),
+        post_mirror_sender=sender,
+        online_gate=gate,
+        delivery_delay_range_seconds=(1, 1),
+        sleep=fake_sleep,
+        now=lambda: 1000,
+    )
+
+    assert await worker.drain_once(limit=10) == 1
+    assert gate.calls == 2
+    assert sleeps == [1]
+    assert sender.calls == [((10,), -100900, 77)]
+    assert [job.message_ids for job in repo.list_ready_post_mirror_deliveries(now=1000, limit=10)] == [(11,)]
 
 
 async def test_post_mirror_outbox_delivery_worker_drains_ready_backlog_until_empty(tmp_path):
@@ -3209,7 +3339,7 @@ async def test_post_mirror_outbox_delivery_worker_keeps_minimum_spacing_for_larg
     assert round(sum(sleeps), 6) == 300
 
 
-async def test_post_mirror_outbox_delivery_worker_marks_session_offline_after_drain(tmp_path):
+async def test_post_mirror_outbox_delivery_worker_does_not_force_offline_after_online_gated_drain(tmp_path):
     repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
     repo.set_post_mirroring_enabled(True)
     repo.set_post_mirror_target_chat_id(-100900)
@@ -3228,6 +3358,7 @@ async def test_post_mirror_outbox_delivery_worker_marks_session_offline_after_dr
         ready_at=1000,
     )
     calls = []
+    requests = []
 
     class OnlineGate:
         async def is_online(self):
@@ -3235,8 +3366,7 @@ async def test_post_mirror_outbox_delivery_worker_marks_session_offline_after_dr
 
     class FakeClient:
         async def __call__(self, request):
-            assert getattr(request, "offline", None) is True
-            calls.append("offline")
+            requests.append(request)
 
         async def get_messages(self, chat_id, *, ids):
             calls.append("load")
@@ -3256,7 +3386,8 @@ async def test_post_mirror_outbox_delivery_worker_marks_session_offline_after_dr
     )
 
     assert await worker.drain_once() == 1
-    assert calls[-1] == "offline"
+    assert calls == ["load", "send"]
+    assert [request.__class__.__name__ for request in requests] == []
 
 
 def test_post_mirror_outbox_online_delivery_window_defaults_to_five_minutes():
