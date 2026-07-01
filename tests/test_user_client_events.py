@@ -3082,7 +3082,7 @@ async def test_post_mirror_outbox_delivery_worker_paces_actual_sends(tmp_path):
     assert sleeps == [6]
 
 
-async def test_post_mirror_outbox_delivery_worker_stops_when_owner_goes_offline_mid_drain(tmp_path):
+async def test_post_mirror_outbox_delivery_worker_continues_within_delivery_window_after_owner_online(tmp_path):
     repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
     repo.set_post_mirroring_enabled(True)
     repo.set_post_mirror_target_chat_id(-100900)
@@ -3130,11 +3130,71 @@ async def test_post_mirror_outbox_delivery_worker_stops_when_owner_goes_offline_
         now=lambda: 1000,
     )
 
-    assert await worker.drain_once(limit=10) == 1
-    assert gate.calls == 2
+    assert await worker.drain_once(limit=10) == 2
+    assert gate.calls == 1
     assert sleeps == [1]
-    assert sender.calls == [((10,), -100900, 77)]
-    assert [job.message_ids for job in repo.list_ready_post_mirror_deliveries(now=1000, limit=10)] == [(11,)]
+    assert sender.calls == [((10,), -100900, 77), ((11,), -100900, 77)]
+    assert repo.list_ready_post_mirror_deliveries(now=1000, limit=10) == []
+
+
+async def test_post_mirror_outbox_delivery_worker_stops_after_online_delivery_window(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.set_post_mirroring_enabled(True)
+    repo.set_post_mirror_target_chat_id(-100900)
+    repo.upsert_post_mirror_source(-100111, "Source Channel", "channel")
+    repo.set_post_mirror_source_enabled(-100111, True)
+    repo.set_post_mirror_source_topic(-100111, 77)
+    for message_id in (10, 11, 12, 13, 14):
+        repo.enqueue_post_mirror_delivery(
+            source_chat_id=-100111,
+            message_ids=(message_id,),
+            is_channel=True,
+            is_group=False,
+            grouped_id=None,
+            target_chat_id=-100900,
+            target_thread_id=77,
+            origin="realtime",
+            ready_at=1000,
+        )
+    elapsed = 0.0
+    sleeps = []
+
+    class OnlineGate:
+        async def is_online(self):
+            return True
+
+    class FakeClient:
+        async def get_messages(self, chat_id, *, ids):
+            return [FakeHistoryMessage(ids[0])]
+
+    async def fake_sleep(delay):
+        nonlocal elapsed
+        sleeps.append(delay)
+        elapsed += delay + 0.5
+
+    sender = FakePostMirrorSender()
+    worker = PostMirrorOutboxDeliveryWorker(
+        state=repo,
+        client=FakeClient(),
+        post_mirror_sender=sender,
+        online_gate=OnlineGate(),
+        delivery_delay_range_seconds=(1, 1),
+        randint=lambda minimum, maximum: 1,
+        sleep=fake_sleep,
+        monotonic=lambda: elapsed,
+        online_delivery_window_seconds=5,
+        now=lambda: 1000,
+    )
+
+    assert await worker.drain_once(limit=10) == 4
+    assert sleeps == [1, 1, 1, 1]
+    assert sender.calls == [
+        ((10,), -100900, 77),
+        ((11,), -100900, 77),
+        ((12,), -100900, 77),
+        ((13,), -100900, 77),
+    ]
+    assert [job.message_ids for job in repo.list_ready_post_mirror_deliveries(now=1000, limit=10)] == [(14,)]
 
 
 async def test_post_mirror_outbox_delivery_worker_drains_ready_backlog_until_empty(tmp_path):

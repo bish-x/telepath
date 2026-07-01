@@ -1720,8 +1720,8 @@ class PostMirrorOutboxDeliveryWorker:
                         started_at=started_at,
                         remaining_sleep_count=len(jobs) - index,
                     )
-                    if not await self._online_gate.is_online():
-                        self._logger.info("post_mirror_outbox_owner_went_offline")
+                    if self._online_delivery_window_expired(started_at):
+                        self._logger.info("post_mirror_outbox_delivery_window_expired")
                         return sent_count
                 with suppress_current_session_offline_updates():
                     delivered = await self._deliver_job(job)
@@ -1734,6 +1734,9 @@ class PostMirrorOutboxDeliveryWorker:
             if len(jobs) < batch_limit:
                 break
         return sent_count
+
+    def _online_delivery_window_expired(self, started_at: float) -> bool:
+        return self._monotonic() - started_at > self._online_delivery_window_seconds
 
     async def _deliver_job(self, job: PostMirrorQueuedDelivery) -> bool:
         try:
