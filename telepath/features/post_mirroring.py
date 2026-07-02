@@ -33,6 +33,19 @@ class PostMirrorSendResult:
 
 
 @dataclass(frozen=True)
+class PostMirrorMessageSnapshot:
+    message_id: int
+    text: str = ""
+    has_media: bool = False
+    media_kind: str | None = None
+    media_path: str | None = None
+    mime_type: str | None = None
+    voice: bool = False
+    video: bool = False
+    video_note: bool = False
+
+
+@dataclass(frozen=True)
 class PostMirrorQueuedDelivery:
     id: int
     source_chat_id: int
@@ -46,6 +59,7 @@ class PostMirrorQueuedDelivery:
     ready_at: int
     attempts: int = 0
     last_error: str | None = None
+    message_snapshots: tuple[PostMirrorMessageSnapshot, ...] = ()
 
 
 class PostMirrorSettingsPort(Protocol):

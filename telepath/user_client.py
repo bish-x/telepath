@@ -8,6 +8,7 @@ import random
 import shutil
 import tempfile
 import time
+import uuid
 from collections import Counter, OrderedDict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
@@ -38,6 +39,7 @@ from telepath.features.channel_reactions import (
 from telepath.features.post_mirroring import (
     PostMirrorEvent,
     PostMirrorFeature,
+    PostMirrorMessageSnapshot,
     PostMirrorQueuedDelivery,
     PostMirrorSendResult,
 )
@@ -991,6 +993,15 @@ class TelethonPostMirrorSender:
                         text_messages.append((text, self._message_entities_for_send(getattr(message, "entities", None))))
                     continue
 
+                local_media_path = self._local_media_path_for_message(message)
+                if local_media_path is not None:
+                    media_files.append(local_media_path)
+                    media_messages.append(message)
+                    media_count += 1
+                    captions.append(getattr(message, "message", None) or "")
+                    caption_entities.append(self._message_entities_for_send(getattr(message, "entities", None)))
+                    continue
+
                 if not self._has_downloadable_media(message):
                     if self._is_webpage_media(message):
                         text = getattr(message, "message", None) or ""
@@ -1101,6 +1112,16 @@ class TelethonPostMirrorSender:
         if not isinstance(entities, (list, tuple)):
             return []
         return [entity for entity in entities if isinstance(entity, types.TypeMessageEntity)]
+
+    @staticmethod
+    def _local_media_path_for_message(message: Any) -> Path | None:
+        media_path = getattr(message, "post_mirror_media_path", None)
+        if media_path is None:
+            return None
+        path = Path(media_path)
+        if not path.exists():
+            raise PostMirrorMediaDownloadError(f"local media snapshot is missing: {path}")
+        return path
 
     @staticmethod
     def _has_downloadable_media(message: Any) -> bool:
@@ -1554,10 +1575,19 @@ class PostMirrorOutboxEnqueuer:
         *,
         origin: str = "realtime",
         ready_at: Callable[[], int] | None = None,
+        client: Any | None = None,
+        media_root: str | Path | None = None,
+        logger_: logging.Logger | None = None,
     ) -> None:
         self._state = state
         self._origin = origin if origin in {"realtime", "history"} else "realtime"
         self._ready_at = ready_at or (lambda: 0)
+        self._client = client
+        self._media_root = Path(media_root) if media_root is not None else self._default_media_root(state)
+        self._media_downloader = (
+            TelethonPostMirrorSender(client, logger_=logger_ or logger) if client is not None else None
+        )
+        self._logger = logger_ or logger
 
     async def copy_post(
         self,
@@ -1567,7 +1597,8 @@ class PostMirrorOutboxEnqueuer:
         target_thread_id: int,
     ) -> PostMirrorSendResult:
         message_ids = event.message_ids or (event.message_id,)
-        self._state.enqueue_post_mirror_delivery(
+        message_snapshots = await self._build_message_snapshots(event)
+        inserted = self._state.enqueue_post_mirror_delivery(
             source_chat_id=event.chat_id,
             message_ids=message_ids,
             is_channel=event.is_channel,
@@ -1577,9 +1608,97 @@ class PostMirrorOutboxEnqueuer:
             target_thread_id=target_thread_id,
             origin=self._origin,
             ready_at=self._ready_at(),
+            message_snapshots=message_snapshots,
         )
+        if not inserted:
+            self._cleanup_message_snapshots(message_snapshots)
         media_count = sum(1 for message in event.messages if getattr(message, "media", None) is not None)
         return PostMirrorSendResult(message_count=len(message_ids), media_count=media_count)
+
+    @staticmethod
+    def _default_media_root(state: Any) -> Path:
+        path = getattr(state, "path", None)
+        if path is not None:
+            return Path(path).parent / "post_mirror_media"
+        return Path("data/post_mirror_media")
+
+    async def _build_message_snapshots(self, event: PostMirrorEvent) -> tuple[PostMirrorMessageSnapshot, ...]:
+        snapshots: list[PostMirrorMessageSnapshot] = []
+        snapshot_dir: Path | None = None
+        try:
+            for message in event.messages:
+                has_media = getattr(message, "media", None) is not None
+                media_kind: str | None = None
+                media_path: str | None = None
+                mime_type = self._message_mime_type(message)
+                if has_media:
+                    if TelethonPostMirrorSender._is_webpage_media(message):
+                        media_kind = "webpage"
+                    elif TelethonPostMirrorSender._has_downloadable_media(message):
+                        if self._media_downloader is None:
+                            raise PostMirrorMediaDownloadError(
+                                f"media snapshot requires Telegram client for message_id={int(message.id)}"
+                            )
+                        if snapshot_dir is None:
+                            snapshot_dir = self._new_snapshot_dir(event)
+                        message_dir = snapshot_dir / str(int(message.id))
+                        message_dir.mkdir(parents=True, exist_ok=True)
+                        downloaded = await self._media_downloader._download_media_to_path(message, message_dir)
+                        if downloaded is None:
+                            raise PostMirrorMediaDownloadError(
+                                f"media snapshot download failed for message_id={int(message.id)}"
+                            )
+                        media_kind = "downloaded"
+                        media_path = str(downloaded)
+                    else:
+                        media_kind = "telegram_copy"
+                snapshots.append(
+                    PostMirrorMessageSnapshot(
+                        message_id=int(message.id),
+                        text=getattr(message, "message", None) or "",
+                        has_media=has_media,
+                        media_kind=media_kind,
+                        media_path=media_path,
+                        mime_type=mime_type,
+                        voice=bool(getattr(message, "voice", False)),
+                        video=bool(getattr(message, "video", False)),
+                        video_note=bool(getattr(message, "video_note", False)),
+                    )
+                )
+        except Exception:
+            if snapshot_dir is not None:
+                shutil.rmtree(snapshot_dir, ignore_errors=True)
+            raise
+        return tuple(snapshots)
+
+    def _new_snapshot_dir(self, event: PostMirrorEvent) -> Path:
+        message_ids = event.message_ids or (event.message_id,)
+        ids_slug = "-".join(str(int(message_id)) for message_id in message_ids)
+        path = self._media_root / str(int(event.chat_id)) / f"{ids_slug}-{uuid.uuid4().hex}"
+        path.mkdir(parents=True, exist_ok=False)
+        (path / ".telepath-post-mirror-snapshot").write_text("", encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _message_mime_type(message: Any) -> str | None:
+        document = TelethonPostMirrorSender._message_document(message)
+        if document is None:
+            return None
+        mime_type = getattr(document, "mime_type", None)
+        return str(mime_type) if mime_type else None
+
+    def _cleanup_message_snapshots(self, message_snapshots: tuple[PostMirrorMessageSnapshot, ...]) -> None:
+        media_root = self._media_root.resolve()
+        parent_dirs = set()
+        for snapshot in message_snapshots:
+            if snapshot.media_path is None:
+                continue
+            media_path = Path(snapshot.media_path).resolve()
+            if not media_path.is_relative_to(media_root):
+                continue
+            parent_dirs.add(media_path.parent.parent)
+        for parent_dir in parent_dirs:
+            shutil.rmtree(parent_dir, ignore_errors=True)
 
 
 class TelegramAuthorizationOnlineGate:
@@ -1743,7 +1862,9 @@ class PostMirrorOutboxDeliveryWorker:
             if not self._delivery_still_allowed(job):
                 self._state.cancel_post_mirror_delivery(job.id, error="post mirror target or source disabled")
                 return False
-            messages = await self._load_messages(job)
+            messages = self._load_messages_from_snapshot(job)
+            if messages is None:
+                messages = await self._load_messages(job)
             if not messages:
                 if job.attempts >= POST_MIRROR_OUTBOX_PERMANENT_FAILURE_ATTEMPTS:
                     self._state.cancel_post_mirror_delivery(
@@ -1795,6 +1916,7 @@ class PostMirrorOutboxDeliveryWorker:
                 )
                 return False
             self._state.mark_post_mirror_delivery_sent(job.id, now=self._now())
+            self._cleanup_job_snapshot_media(job)
             self._logger.info(
                 "post_mirror_outbox_delivered job_id=%s source_chat_id=%s message_ids=%s target_chat_id=%s",
                 job.id,
@@ -1858,6 +1980,73 @@ class PostMirrorOutboxDeliveryWorker:
             messages = [result]
         by_id = {int(getattr(message, "id")): message for message in messages}
         return [by_id[message_id] for message_id in job.message_ids if message_id in by_id]
+
+    @staticmethod
+    def _cleanup_job_snapshot_media(job: PostMirrorQueuedDelivery) -> None:
+        snapshot_dirs = set()
+        for snapshot in job.message_snapshots:
+            if snapshot.media_path is None:
+                continue
+            media_path = Path(snapshot.media_path).resolve()
+            snapshot_dir = media_path.parent.parent
+            if not (snapshot_dir / ".telepath-post-mirror-snapshot").exists():
+                continue
+            snapshot_dirs.add(snapshot_dir)
+        for snapshot_dir in snapshot_dirs:
+            shutil.rmtree(snapshot_dir, ignore_errors=True)
+
+    def _load_messages_from_snapshot(self, job: PostMirrorQueuedDelivery) -> list[Any] | None:
+        if not job.message_snapshots:
+            return None
+        messages = []
+        for snapshot in job.message_snapshots:
+            message = self._message_from_snapshot(snapshot)
+            if message is None:
+                return None
+            messages.append(message)
+        return messages
+
+    @staticmethod
+    def _message_from_snapshot(snapshot: PostMirrorMessageSnapshot) -> Any | None:
+        base = {
+            "id": snapshot.message_id,
+            "message": snapshot.text,
+            "entities": None,
+            "voice": snapshot.voice,
+            "video": snapshot.video,
+            "video_note": snapshot.video_note,
+        }
+        if not snapshot.has_media:
+            return SimpleNamespace(**base, media=None, file=None, photo=None, document=None)
+        if snapshot.media_kind == "webpage":
+            return SimpleNamespace(
+                **base,
+                media=SimpleNamespace(webpage=object()),
+                file=None,
+                photo=None,
+                document=None,
+            )
+        if snapshot.media_kind != "downloaded" or snapshot.media_path is None:
+            return None
+        media_path = Path(snapshot.media_path)
+        if not media_path.exists():
+            return None
+        document = None
+        photo = None
+        if snapshot.mime_type:
+            document = SimpleNamespace(mime_type=snapshot.mime_type, attributes=())
+            media = SimpleNamespace(document=document)
+        else:
+            photo = object()
+            media = SimpleNamespace(photo=photo)
+        return SimpleNamespace(
+            **base,
+            media=media,
+            file=object(),
+            photo=photo,
+            document=document,
+            post_mirror_media_path=str(media_path),
+        )
 
     async def _resolve_target_thread_id(self, job: PostMirrorQueuedDelivery) -> int | None:
         if job.target_thread_id is not None:
@@ -4107,8 +4296,8 @@ async def run_user_client(
     reaction_sender = TelethonChannelReactionSender(client, send_delay_seconds=0)
     cached_reaction_sender = CachedTelethonChannelReactionSender(reaction_sender, state)
     post_mirror_delivery_sender = TelethonPostMirrorSender(client)
-    post_mirror_realtime_enqueuer = PostMirrorOutboxEnqueuer(state, origin="realtime")
-    post_mirror_history_enqueuer = PostMirrorOutboxEnqueuer(state, origin="history")
+    post_mirror_realtime_enqueuer = PostMirrorOutboxEnqueuer(state, origin="realtime", client=client)
+    post_mirror_history_enqueuer = PostMirrorOutboxEnqueuer(state, origin="history", client=client)
     post_mirror_topic_manager = TelethonForumTopicManager(client)
     post_mirror_online_gate = TelegramAuthorizationOnlineGate(
         client,

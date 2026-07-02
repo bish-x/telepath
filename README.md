@@ -248,11 +248,15 @@ creates the topic through the Telegram user account, stores the topic root
 message id, and enables that source.
 
 New posts are accepted into the mirror outbox in realtime without the autolike
-delay. During gated delivery, protected-source cases are handled by copying
-content as new messages: Telepath downloads media to a temporary directory,
-sends the text/media/album to the configured topic, then removes the temporary
-files. History backfill uses the same outbox and copy path, so it can safely
-coexist with realtime mirroring.
+delay. At enqueue time, Telepath snapshots the post text/captions into SQLite
+and immediately downloads photos, videos, voice notes, and documents into
+`post_mirror_media` next to the assistant database. Gated delivery sends from
+that local snapshot, so ordinary text and downloadable media survive source
+post deletion before the owner comes online. Pending media snapshots remain on
+disk until successful delivery, then they are removed. Telegram-native media
+without a downloadable file, such as polls or locations, still uses Telegram's
+original message copy path. History backfill uses the same outbox and copy
+path, so it can safely coexist with realtime mirroring.
 
 Delivery is gated to avoid the assistant making the owner account look online:
 realtime and history workers accept posts into the local SQLite outbox, while a

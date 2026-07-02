@@ -2,6 +2,7 @@ import asyncio
 import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -2631,6 +2632,165 @@ async def test_post_mirror_outbox_enqueuer_persists_job_without_sending(tmp_path
     assert jobs[0].target_chat_id == -100900
     assert jobs[0].target_thread_id == 77
     assert jobs[0].origin == "realtime"
+
+
+async def test_post_mirror_outbox_delivery_uses_text_snapshot_when_source_message_was_deleted(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.set_post_mirroring_enabled(True)
+    repo.set_post_mirror_target_chat_id(-100900)
+    repo.upsert_post_mirror_source(-100111, "Source Channel", "channel")
+    repo.set_post_mirror_source_enabled(-100111, True)
+    repo.set_post_mirror_source_topic(-100111, 77)
+    message = FakeHistoryMessage(10)
+    message.message = "saved post text"
+    event = build_post_mirror_event(
+        type(
+            "Event",
+            (),
+            {
+                "chat_id": -100111,
+                "is_channel": True,
+                "is_group": False,
+                "messages": [message],
+                "message": message,
+            },
+        )()
+    )
+    enqueuer = PostMirrorOutboxEnqueuer(repo, origin="realtime")
+
+    await enqueuer.copy_post(event, target_chat_id=-100900, target_thread_id=77)
+
+    class OnlineGate:
+        async def is_online(self):
+            return True
+
+    class DeletedSourceClient:
+        async def get_messages(self, chat_id, *, ids):
+            return []
+
+        async def __call__(self, request):
+            return SimpleNamespace()
+
+    class SnapshotSender:
+        def __init__(self):
+            self.events = []
+
+        async def copy_post(self, event, *, target_chat_id, target_thread_id):
+            from telepath.features.post_mirroring import PostMirrorSendResult
+
+            self.events.append((event, target_chat_id, target_thread_id))
+            return PostMirrorSendResult(message_count=len(event.message_ids))
+
+    sender = SnapshotSender()
+    worker = PostMirrorOutboxDeliveryWorker(
+        state=repo,
+        client=DeletedSourceClient(),
+        post_mirror_sender=sender,
+        online_gate=OnlineGate(),
+        now=lambda: 1000,
+    )
+
+    assert await worker.drain_once(limit=10) == 1
+    delivered_event, target_chat_id, target_thread_id = sender.events[0]
+    assert delivered_event.messages[0].message == "saved post text"
+    assert target_chat_id == -100900
+    assert target_thread_id == 77
+
+
+async def test_post_mirror_outbox_enqueuer_downloads_media_snapshot_before_delivery(tmp_path):
+    repo = SQLiteAssistantRepository(tmp_path / "assistant.sqlite3")
+    repo.set_post_mirroring_enabled(True)
+    repo.set_post_mirror_target_chat_id(-100900)
+    repo.upsert_post_mirror_source(-100111, "Source Channel", "channel")
+    repo.set_post_mirror_source_enabled(-100111, True)
+    repo.set_post_mirror_source_topic(-100111, 77)
+
+    class MediaMessage:
+        id = 10
+        message = "photo caption"
+        media = SimpleNamespace(photo=object())
+        file = object()
+        photo = object()
+        document = None
+        entities = None
+
+    class DownloadingClient:
+        def __init__(self):
+            self.download_calls = []
+
+        async def download_media(self, message, file):
+            self.download_calls.append((message.id, Path(file)))
+            path = Path(file) / "photo.jpg"
+            path.write_bytes(b"photo-bytes")
+            return str(path)
+
+        async def __call__(self, request):
+            return SimpleNamespace()
+
+    client = DownloadingClient()
+    message = MediaMessage()
+    event = build_post_mirror_event(
+        type(
+            "Event",
+            (),
+            {
+                "chat_id": -100111,
+                "is_channel": True,
+                "is_group": False,
+                "messages": [message],
+                "message": message,
+            },
+        )()
+    )
+    enqueuer = PostMirrorOutboxEnqueuer(
+        repo,
+        origin="realtime",
+        client=client,
+        media_root=tmp_path / "post-mirror-media",
+    )
+
+    await enqueuer.copy_post(event, target_chat_id=-100900, target_thread_id=77)
+
+    assert len(client.download_calls) == 1
+    assert client.download_calls[0][0] == 10
+    saved_path = client.download_calls[0][1] / "photo.jpg"
+    assert saved_path.read_bytes() == b"photo-bytes"
+
+    class OnlineGate:
+        async def is_online(self):
+            return True
+
+    class DeletedSourceClient:
+        async def get_messages(self, chat_id, *, ids):
+            return []
+
+        async def __call__(self, request):
+            return SimpleNamespace()
+
+    class SnapshotSender:
+        def __init__(self):
+            self.events = []
+
+        async def copy_post(self, event, *, target_chat_id, target_thread_id):
+            from telepath.features.post_mirroring import PostMirrorSendResult
+
+            self.events.append(event)
+            return PostMirrorSendResult(message_count=len(event.message_ids), media_count=1)
+
+    sender = SnapshotSender()
+    worker = PostMirrorOutboxDeliveryWorker(
+        state=repo,
+        client=DeletedSourceClient(),
+        post_mirror_sender=sender,
+        online_gate=OnlineGate(),
+        now=lambda: 1000,
+    )
+
+    assert await worker.drain_once(limit=10) == 1
+    delivered_message = sender.events[0].messages[0]
+    assert delivered_message.message == "photo caption"
+    assert delivered_message.post_mirror_media_path == str(saved_path)
+    assert not saved_path.exists()
 
 
 async def test_telegram_authorization_online_gate_ignores_current_session():

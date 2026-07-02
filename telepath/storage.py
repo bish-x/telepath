@@ -14,7 +14,11 @@ from telepath.features.channel_reactions import (
     VALID_REACTION_SELECTION_STRATEGIES,
     VALID_REACTION_SOURCES,
 )
-from telepath.features.post_mirroring import PostMirrorQueuedDelivery, PostMirrorSourceSettings
+from telepath.features.post_mirroring import (
+    PostMirrorMessageSnapshot,
+    PostMirrorQueuedDelivery,
+    PostMirrorSourceSettings,
+)
 from telepath.prompts import DEFAULT_TEXT_POLISH_PROMPT
 
 
@@ -175,6 +179,7 @@ class SQLiteAssistantRepository:
                     ready_at INTEGER NOT NULL DEFAULT 0,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     last_error TEXT,
+                    message_snapshots TEXT,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     sent_at INTEGER,
@@ -182,6 +187,12 @@ class SQLiteAssistantRepository:
                 )
                 """
             )
+            post_mirror_outbox_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(post_mirror_outbox)").fetchall()
+            }
+            if "message_snapshots" not in post_mirror_outbox_columns:
+                conn.execute("ALTER TABLE post_mirror_outbox ADD COLUMN message_snapshots TEXT")
             reaction_columns = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(channel_reaction_settings)").fetchall()
@@ -548,11 +559,13 @@ class SQLiteAssistantRepository:
         target_thread_id: int | None,
         origin: str = "realtime",
         ready_at: int = 0,
+        message_snapshots: tuple[PostMirrorMessageSnapshot, ...] | None = None,
     ) -> bool:
         normalized_ids = tuple(dict.fromkeys(int(message_id) for message_id in message_ids))
         if not normalized_ids:
             return False
         payload = self._post_mirror_message_ids_payload(normalized_ids)
+        snapshots_payload = self._post_mirror_message_snapshots_payload(message_snapshots or ())
         normalized_origin = origin if origin in {"realtime", "history"} else "realtime"
         with self._connect() as conn:
             cursor = conn.execute(
@@ -566,9 +579,10 @@ class SQLiteAssistantRepository:
                     target_chat_id,
                     target_thread_id,
                     origin,
-                    ready_at
+                    ready_at,
+                    message_snapshots
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     int(source_chat_id),
@@ -580,6 +594,7 @@ class SQLiteAssistantRepository:
                     int(target_thread_id) if target_thread_id is not None else None,
                     normalized_origin,
                     int(ready_at),
+                    snapshots_payload,
                 ),
             )
         return cursor.rowcount == 1
@@ -600,7 +615,8 @@ class SQLiteAssistantRepository:
                     origin,
                     ready_at,
                     attempts,
-                    last_error
+                    last_error,
+                    message_snapshots
                 FROM post_mirror_outbox
                 WHERE status = 'pending' AND ready_at <= ?
                 ORDER BY id ASC
@@ -660,6 +676,59 @@ class SQLiteAssistantRepository:
     def _post_mirror_message_ids_payload(message_ids: tuple[int, ...]) -> str:
         return json.dumps(list(message_ids), separators=(",", ":"))
 
+    @staticmethod
+    def _post_mirror_message_snapshots_payload(message_snapshots: tuple[PostMirrorMessageSnapshot, ...]) -> str | None:
+        if not message_snapshots:
+            return None
+        payload = [
+            {
+                "message_id": snapshot.message_id,
+                "text": snapshot.text,
+                "has_media": snapshot.has_media,
+                "media_kind": snapshot.media_kind,
+                "media_path": snapshot.media_path,
+                "mime_type": snapshot.mime_type,
+                "voice": snapshot.voice,
+                "video": snapshot.video,
+                "video_note": snapshot.video_note,
+            }
+            for snapshot in message_snapshots
+        ]
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _post_mirror_message_snapshots_from_payload(payload: str | None) -> tuple[PostMirrorMessageSnapshot, ...]:
+        if not payload:
+            return ()
+        try:
+            raw_items = json.loads(payload)
+        except (TypeError, json.JSONDecodeError):
+            return ()
+        if not isinstance(raw_items, list):
+            return ()
+        snapshots = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                message_id = int(item["message_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            snapshots.append(
+                PostMirrorMessageSnapshot(
+                    message_id=message_id,
+                    text=str(item.get("text") or ""),
+                    has_media=bool(item.get("has_media")),
+                    media_kind=str(item["media_kind"]) if item.get("media_kind") is not None else None,
+                    media_path=str(item["media_path"]) if item.get("media_path") is not None else None,
+                    mime_type=str(item["mime_type"]) if item.get("mime_type") is not None else None,
+                    voice=bool(item.get("voice")),
+                    video=bool(item.get("video")),
+                    video_note=bool(item.get("video_note")),
+                )
+            )
+        return tuple(snapshots)
+
     def _post_mirror_delivery_from_row(self, row: sqlite3.Row) -> PostMirrorQueuedDelivery:
         try:
             message_ids = tuple(int(message_id) for message_id in json.loads(row["message_ids"]))
@@ -678,6 +747,7 @@ class SQLiteAssistantRepository:
             ready_at=int(row["ready_at"]),
             attempts=int(row["attempts"]),
             last_error=row["last_error"],
+            message_snapshots=self._post_mirror_message_snapshots_from_payload(row["message_snapshots"]),
         )
 
     def _delete_processing_claims(
